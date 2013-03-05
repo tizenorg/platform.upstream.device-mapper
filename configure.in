@@ -1,6 +1,6 @@
 ###############################################################################
 ## Copyright (C) 2000-2004 Sistina Software, Inc. All rights reserved.
-## Copyright (C) 2004-2009 Red Hat, Inc. All rights reserved.
+## Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
 ##
 ## This copyrighted material is made available to anyone wishing to use,
 ## modify, copy, or redistribute it subject to the terms and conditions
@@ -31,22 +31,26 @@ case "$host_os" in
 		CFLAGS="$CFLAGS"
 		COPTIMISE_FLAG="-O2"
 		CLDFLAGS="$CLDFLAGS -Wl,--version-script,.export.sym"
+		ELDFLAGS="-Wl,--export-dynamic"
+		# FIXME Generate list and use --dynamic-list=.dlopen.sym
 		CLDWHOLEARCHIVE="-Wl,-whole-archive"
 		CLDNOWHOLEARCHIVE="-Wl,-no-whole-archive"
 		LDDEPS="$LDDEPS .export.sym"
-		LDFLAGS="$LDFLAGS -Wl,--export-dynamic"
 		LIB_SUFFIX=so
 		DEVMAPPER=yes
+		LVMETAD=no
 		ODIRECT=yes
 		DM_IOCTLS=yes
 		SELINUX=yes
 		CLUSTER=internal
 		FSADM=yes
+		BLKDEACTIVATE=yes
 		;;
 	darwin*)
 		CFLAGS="$CFLAGS -no-cpp-precomp -fno-common"
 		COPTIMISE_FLAG="-O2"
 		CLDFLAGS="$CLDFLAGS"
+		ELDFLAGS=
 		CLDWHOLEARCHIVE="-all_load"
 		CLDNOWHOLEARCHIVE=
 		LIB_SUFFIX=dylib
@@ -56,6 +60,7 @@ case "$host_os" in
 		SELINUX=no
 		CLUSTER=none
 		FSADM=no
+		BLKDEACTIVATE=no
 		;;
 esac
 
@@ -213,6 +218,33 @@ AC_ARG_WITH(device-mode,
 	    DM_DEVICE_MODE=$withval, DM_DEVICE_MODE=0600)
 AC_MSG_RESULT($DM_DEVICE_MODE)
 
+AC_MSG_CHECKING(when to create device nodes)
+AC_ARG_WITH(device-nodes-on,
+	    AC_HELP_STRING([--with-device-nodes-on=ON],
+			   [create nodes on resume or create [[ON=resume]]]),
+	    ADD_NODE=$withval, ADD_NODE=resume)
+case "$ADD_NODE" in
+ resume) add_on=DM_ADD_NODE_ON_RESUME;;
+ create) add_on=DM_ADD_NODE_ON_CREATE;;
+ *) AC_MSG_ERROR([--with-device-nodes-on parameter invalid]);;
+esac
+AC_MSG_RESULT(on $ADD_NODE)
+AC_DEFINE_UNQUOTED([DEFAULT_DM_ADD_NODE], $add_on, [Define default node creation behavior with dmsetup create])
+
+AC_MSG_CHECKING(default name mangling)
+AC_ARG_WITH(default-name-mangling,
+	    AC_HELP_STRING([--with-default-name-mangling=MANGLING],
+			   [default name mangling: auto/none/hex [[MANGLING=auto]]]),
+	    MANGLING=$withval, MANGLING=auto)
+case "$MANGLING" in
+ auto) mangling=DM_STRING_MANGLING_AUTO;;
+ disabled) mangling=DM_STRING_MANGLING_NONE;;
+ hex) mangling=DM_STRING_MANGLING_HEX;;
+ *) AC_MSG_ERROR([--with-default-name-mangling parameter invalid]);;
+esac
+AC_MSG_RESULT($MANGLING)
+AC_DEFINE_UNQUOTED([DEFAULT_DM_NAME_MANGLING], $mangling, [Define default name mangling behaviour])
+
 ################################################################################
 dnl -- LVM1 tool fallback option
 AC_MSG_CHECKING(whether to enable lvm1 fallback)
@@ -328,6 +360,26 @@ if test x$MIRRORS = xinternal; then
 fi
 
 ################################################################################
+dnl -- raid inclusion type
+AC_MSG_CHECKING(whether to include raid)
+AC_ARG_WITH(raid,
+	    AC_HELP_STRING([--with-raid=TYPE],
+			   [mirror support: internal/shared/none
+			    [[TYPE=internal]]]),
+	    RAID=$withval, RAID=internal)
+AC_MSG_RESULT($RAID)
+
+if [[ "x$RAID" != xnone -a "x$RAID" != xinternal -a "x$RAID" != xshared ]];
+ then  AC_MSG_ERROR(
+--with-raid parameter invalid
+)
+fi;
+
+if test x$RAID = xinternal; then
+	AC_DEFINE([RAID_INTERNAL], 1, [Define to 1 to include built-in support for raid.])
+fi
+
+################################################################################
 dnl -- asynchronous volume replicator inclusion type
 AC_MSG_CHECKING(whether to include replicators)
 AC_ARG_WITH(replicators,
@@ -343,6 +395,41 @@ case "$REPLICATORS" in
 		[Define to 1 to include built-in support for replicators.]) ;;
   *) AC_MSG_ERROR([--with-replicators parameter invalid ($REPLICATORS)]) ;;
 esac
+
+################################################################################
+dnl -- thin provisioning
+AC_MSG_CHECKING(whether to include thin provisioning)
+AC_ARG_WITH(thin,
+	    AC_HELP_STRING([--with-thin=TYPE],
+			   [thin provisioning support: internal/shared/none
+			    [[TYPE=none]]]),
+	    THIN=$withval, THIN=none)
+AC_MSG_RESULT($THIN)
+
+case "$THIN" in
+  none|shared) ;;
+  internal) AC_DEFINE([THIN_INTERNAL], 1,
+		[Define to 1 to include built-in support for thin provisioning.]) ;;
+  *) AC_MSG_ERROR([--with-thin parameter invalid ($THIN)]) ;;
+esac
+
+case "$THIN" in
+  internal|shared)
+	AC_ARG_WITH(thin-check,
+		AC_HELP_STRING([--with-thin-check=PATH],
+			       [thin_check tool: [[autodetect]]]),
+			       THIN_CHECK_CMD=$withval, THIN_CHECK_CMD="autodetect")
+	# Empty means a config way to ignore thin checking
+	if test "$THIN_CHECK_CMD" = "autodetect"; then
+		AC_PATH_PROG(THIN_CHECK_CMD, thin_check)
+		test -z "$THIN_CHECK_CMD" && AC_MSG_ERROR(thin_check not found in path $PATH)
+	fi
+	;;
+esac
+
+AC_DEFINE_UNQUOTED([THIN_CHECK_CMD], ["$THIN_CHECK_CMD"],
+		   [The path to 'thin_check', if available.])
+
 
 ################################################################################
 dnl -- Disable readline
@@ -368,6 +455,10 @@ AC_ARG_ENABLE(ocf,
 			     [enable Open Cluster Framework (OCF) compliant resource agents]),
 	      OCF=$enableval, OCF=no)
 AC_MSG_RESULT($OCF)
+AC_ARG_WITH(ocfdir,
+	    AC_HELP_STRING([--with-ocfdir=DIR],
+			   [install OCF files in DIR [[PREFIX/lib/ocf/resource.d/lvm2]]]),
+	    OCFDIR=$withval, OCFDIR='${prefix}/lib/ocf/resource.d/lvm2')
 
 ################################################################################
 dnl -- Init pkg-config with dummy invokation:
@@ -381,12 +472,37 @@ pkg_config_init() {
 }
 
 ################################################################################
+dnl -- Set up pidfile and run directory
+AH_TEMPLATE(DEFAULT_PID_DIR)
+AC_ARG_WITH(default-pid-dir,
+	    AC_HELP_STRING([--with-default-pid-dir=PID_DIR],
+			   [Default directory to keep PID files in. [[/var/run]]]),
+	    DEFAULT_PID_DIR="$withval", DEFAULT_PID_DIR="/var/run")
+AC_DEFINE_UNQUOTED(DEFAULT_PID_DIR, ["$DEFAULT_PID_DIR"],
+		   [Default directory to keep PID files in.])
+
+AH_TEMPLATE(DEFAULT_DM_RUN_DIR, [Name of default DM run directory.])
+AC_ARG_WITH(default-dm-run-dir,
+	    AC_HELP_STRING([--with-default-dm-run-dir=DM_RUN_DIR],
+			   [ Default DM run directory. [[/var/run]]]),
+	    DEFAULT_DM_RUN_DIR="$withval", DEFAULT_DM_RUN_DIR="/var/run")
+AC_DEFINE_UNQUOTED(DEFAULT_DM_RUN_DIR, ["$DEFAULT_DM_RUN_DIR"],
+		   [Default DM run directory.])
+
+AH_TEMPLATE(DEFAULT_RUN_DIR, [Name of default LVM run directory.])
+AC_ARG_WITH(default-run-dir,
+	    AC_HELP_STRING([--with-default-run-dir=RUN_DIR],
+			   [Default LVM run directory. [[/var/run/lvm]]]),
+	    DEFAULT_RUN_DIR="$withval", DEFAULT_RUN_DIR="/var/run/lvm")
+AC_DEFINE_UNQUOTED(DEFAULT_RUN_DIR, ["$DEFAULT_RUN_DIR"],
+		   [Default LVM run directory.])
+
+################################################################################
 dnl -- Build cluster LVM daemon
 AC_MSG_CHECKING(whether to build cluster LVM daemon)
 AC_ARG_WITH(clvmd,
   [  --with-clvmd=TYPE       build cluster LVM Daemon
                           The following cluster manager combinations are valid:
-                           * cman,gulm             (RHEL4 or equivalent)
                            * cman                  (RHEL5 or equivalent)
                            * cman,corosync,openais (or selection of them)
                            * singlenode            (localhost only)
@@ -412,14 +528,12 @@ fi
 dnl -- Express clvmd init script Required-Start / Required-Stop
 CLVMD_CMANAGERS=""
 dnl -- On RHEL4/RHEL5, qdiskd is started from a separate init script.
-dnl -- Enable if we are build for either cman or gulm.
+dnl -- Enable if we are build for cman.
 CLVMD_NEEDS_QDISKD=no
 
 dnl -- define build types
 if [[ `expr x"$CLVMD" : '.*gulm.*'` != 0 ]]; then
-	BUILDGULM=yes
-	CLVMD_CMANAGERS="$CLVMD_CMANAGERS lock_gulmd"
-	CLVMD_NEEDS_QDISKD=yes
+	AC_MSG_ERROR([Since version 2.02.87 GULM locking is no longer supported.]);
 fi
 if [[ `expr x"$CLVMD" : '.*cman.*'` != 0 ]]; then
 	BUILDCMAN=yes
@@ -438,14 +552,6 @@ if test x$CLVMD_NEEDS_QDISKD != xno; then
 	CLVMD_CMANAGERS="$CLVMD_CMANAGERS qdiskd"
 fi
 
-dnl -- sanity check around user selection
-if test x$BUILDGULM = xyes; then
-	if test x$BUILDCOROSYNC = xyes || \
-	   test x$BUILDOPENAIS = xyes; then
-		AC_MSG_ERROR([requested clvmd configuration is not valid])
-	fi
-fi
-
 dnl -- define a soft bailout if we are autodetecting
 soft_bailout() {
 	NOTFOUND=1
@@ -457,10 +563,9 @@ hard_bailout() {
 
 dnl -- if clvmd=all then set soft_bailout (we don't want to error)
 dnl -- and set all builds to yes. We need to do this here
-dnl -- to skip the gulm + openais|corosync sanity check above.
+dnl -- to skip the openais|corosync sanity check above.
 if test x$CLVMD = xall; then
 	bailout=soft_bailout
-	BUILDGULM=yes
 	BUILDCMAN=yes
 	BUILDCOROSYNC=yes
 	BUILDOPENAIS=yes
@@ -481,28 +586,6 @@ check_lib_no_libs() {
 		     [$lib_no_libs_args])
 	LIBS=$ac_check_lib_save_LIBS
 }
-
-dnl -- Look for gulm libraries if required.
-if test x$BUILDGULM = xyes; then
-	PKG_CHECK_MODULES(CCS, libccs, [HAVE_CCS=yes],
-		[NOTFOUND=0
-		AC_CHECK_HEADERS(ccs.h,,$bailout)
-		check_lib_no_libs ccs ccs_connect
-		if test $NOTFOUND = 0; then
-			AC_MSG_RESULT([no pkg for libccs, using -lccs])
-			CCS_LIBS="-lccs"
-			HAVE_CCS=yes
-		fi])
-	PKG_CHECK_MODULES(GULM, libgulm, [HAVE_GULM=yes],
-		[NOTFOUND=0
-		AC_CHECK_HEADERS(libgulm.h,,$bailout)
-		check_lib_no_libs gulm lg_core_login
-		if test $NOTFOUND = 0; then
-			AC_MSG_RESULT([no pkg for libgulm, using -lgulm])
-			GULM_LIBS="-lgulm"
-			HAVE_GULM=yes
-		fi])
-fi
 
 dnl -- Look for cman libraries if required.
 if test x$BUILDCMAN = xyes; then
@@ -526,6 +609,7 @@ if test x$BUILDCOROSYNC = xyes || \
    test x$BUILDOPENAIS = xyes; then
 	PKG_CHECK_MODULES(COROSYNC, corosync, [HAVE_COROSYNC=yes], $bailout)
 	CHECKCONFDB=yes
+	CHECKCMAP=yes
 fi
 
 dnl -- Look for corosync libraries if required.
@@ -544,7 +628,7 @@ fi
 dnl -- Below are checks for libraries common to more than one build.
 
 dnl -- Check confdb library.
-dnl -- mandatory for corosync build.
+dnl -- mandatory for corosync < 2.0 build.
 dnl -- optional for openais/cman build.
 
 if test x$CHECKCONFDB = xyes; then
@@ -563,11 +647,34 @@ if test x$CHECKCONFDB = xyes; then
 		CONFDB_LIBS="-lconfdb"
 		HAVE_CONFDB=yes
 	fi
+fi
 
-	if test x$BUILDCOROSYNC = xyes && \
-	   test x$HAVE_CONFDB != xyes &&
+dnl -- Check cmap library
+dnl -- mandatory for corosync >= 2.0 build.
+
+if test x$CHECKCMAP = xyes; then
+	PKG_CHECK_MODULES(CMAP, libcmap,
+			  [HAVE_CMAP=yes],
+			  [HAVE_CMAP=no])
+
+	AC_CHECK_HEADERS(corosync/cmap.h,
+		[HAVE_CMAP_H=yes],
+		[HAVE_CMAP_H=no])
+
+	if test x$HAVE_CMAP != xyes && \ 
+	   test x$HAVE_CMAP_H = xyes; then
+		check_lib_no_libs cmap cmap_initialize
+		AC_MSG_RESULT([no pkg for cmap, using -lcmap])
+		CMAP_LIBS="-lcmap"
+		HAVE_CMAP=yes
+	fi
+fi
+
+if test x$BUILDCOROSYNC = xyes; then
+	if test x$HAVE_CMAP != xyes && \
+	   test x$HAVE_CONFDB != xyes && \
 	   test x$CLVMD != xall; then
-		AC_MSG_ERROR([bailing out... confdb library is required])
+		AC_MSG_ERROR([bailing out... cmap (corosync >= 2.0) or confdb (corosync < 2.0) library is required])
 	fi
 fi
 
@@ -596,13 +703,6 @@ if test x$CLVMD = xall; then
 	CLVMD=none
 	CLVMD_CMANAGERS=""
 	CLVMD_NEEDS_QDISKD=no
-	if test x$HAVE_CCS = xyes && \
-	   test x$HAVE_GULM = xyes; then
-		AC_MSG_RESULT([Enabling clvmd gulm cluster manager])
-		CLVMD="$CLVMD,gulm"
-		CLVMD_CMANAGERS="$CLVMD_CMANAGERS lock_gulmd"
-		CLVMD_NEEDS_QDISKD=yes
-	fi
 	if test x$HAVE_CMAN = xyes && \
 	   test x$HAVE_DLM = xyes; then
 		AC_MSG_RESULT([Enabling clvmd cman cluster manager])
@@ -613,11 +713,12 @@ if test x$CLVMD = xall; then
 	if test x$HAVE_COROSYNC = xyes && \
 	   test x$HAVE_QUORUM = xyes && \
 	   test x$HAVE_CPG = xyes && \
-	   test x$HAVE_DLM = xyes && \
-	   test x$HAVE_CONFDB = xyes; then
+	   test x$HAVE_DLM = xyes; then
+	   if test x$HAVE_CONFDB = xyes || test x$HAVE_CMAP = xyes; then
 		AC_MSG_RESULT([Enabling clvmd corosync cluster manager])
 		CLVMD="$CLVMD,corosync"
 		CLVMD_CMANAGERS="$CLVMD_CMANAGERS corosync"
+	   fi
 	fi
 	if test x$HAVE_COROSYNC = xyes && \
 	   test x$HAVE_CPG = xyes && \
@@ -634,14 +735,23 @@ if test x$CLVMD = xall; then
 	fi
 fi
 
+dnl -- Fixup CLVMD_CMANAGERS with new corosync
+dnl -- clvmd built with corosync >= 2.0 needs dlm (either init or systemd service)
+dnl -- to be started.
+if [[ `expr x"$CLVMD" : '.*corosync.*'` != 0 ]]; then
+   if test x$HAVE_CMAP = xyes; then
+	CLVMD_CMANAGERS="$CLVMD_CMANAGERS dlm"
+   fi
+fi
+
 ################################################################################
 dnl -- clvmd pidfile
 if test "x$CLVMD" != xnone; then
 	AC_ARG_WITH(clvmd-pidfile,
 		    AC_HELP_STRING([--with-clvmd-pidfile=PATH],
-				   [clvmd pidfile [[/var/run/clvmd.pid]]]),
+				   [clvmd pidfile [[PID_DIR/clvmd.pid]]]),
 		    CLVMD_PIDFILE=$withval,
-		    CLVMD_PIDFILE="/var/run/clvmd.pid")
+		    CLVMD_PIDFILE="$DEFAULT_PID_DIR/clvmd.pid")
 	AC_DEFINE_UNQUOTED(CLVMD_PIDFILE, ["$CLVMD_PIDFILE"],
 			   [Path to clvmd pidfile.])
 fi
@@ -662,9 +772,9 @@ dnl -- cmirrord pidfile
 if test "x$BUILD_CMIRRORD" = xyes; then
 	AC_ARG_WITH(cmirrord-pidfile,
 		    AC_HELP_STRING([--with-cmirrord-pidfile=PATH],
-				   [cmirrord pidfile [[/var/run/cmirrord.pid]]]),
+				   [cmirrord pidfile [[PID_DIR/cmirrord.pid]]]),
 		    CMIRRORD_PIDFILE=$withval,
-		    CMIRRORD_PIDFILE="/var/run/cmirrord.pid")
+		    CMIRRORD_PIDFILE="$DEFAULT_PID_DIR/cmirrord.pid")
 	AC_DEFINE_UNQUOTED(CMIRRORD_PIDFILE, ["$CMIRRORD_PIDFILE"],
 			   [Path to cmirrord pidfile.])
 fi
@@ -676,7 +786,12 @@ if [[ "x$BUILD_CMIRRORD" = xyes ]]; then
 	if  test x$PKGCONFIG_INIT != x1; then
 		pkg_config_init
 	fi
-	PKG_CHECK_MODULES(SACKPT, libSaCkpt)
+
+	AC_DEFINE([CMIRROR_HAS_CHECKPOINT], 1, [Define to 1 to include libSaCkpt.])
+	PKG_CHECK_MODULES(SACKPT, libSaCkpt, [HAVE_SACKPT=yes],
+		[AC_MSG_RESULT([no libSaCkpt, compiling without it])
+		AC_DEFINE([CMIRROR_HAS_CHECKPOINT], 0, [Define to 0 to exclude libSaCkpt.])])
+
 	if test x$HAVE_CPG != xyes; then
 		PKG_CHECK_MODULES(CPG, libcpg)
 	fi
@@ -743,11 +858,10 @@ AC_ARG_ENABLE(testing,
 AC_MSG_RESULT($TESTING)
 
 if test "$TESTING" = yes; then
-   AC_PATH_PROG(RUBY19, ruby1.9)
-   AC_PATH_PROG(VALGRIND, valgrind)
-   if test -z "$RUBY19" -o -z "$VALGRIND"; then
-       AC_MSG_ERROR([ruby1.9 and valgrind are required for testing])
-   fi
+	if  test x$PKGCONFIG_INIT != x1; then
+		pkg_config_init
+	fi
+	PKG_CHECK_MODULES(CUNIT, cunit >= 2.0)
 fi
 
 ################################################################################
@@ -759,8 +873,10 @@ AC_ARG_ENABLE(valgrind_pool,
 AC_MSG_RESULT($VALGRIND_POOL)
 
 if test "$VALGRIND_POOL" = yes; then
-    AC_CHECK_HEADERS([valgrind/memcheck.h], , [AC_MSG_ERROR(bailing out)])
+    PKG_CHECK_MODULES(VALGRIND, valgrind, [], [AC_MSG_ERROR(bailing out)])
     AC_DEFINE([VALGRIND_POOL], 1, [Enable a valgrind aware build of pool])
+    AC_SUBST(VALGRIND_POOL)
+    AC_SUBST(VALGRIND_CFLAGS)
 fi
 
 ################################################################################
@@ -777,6 +893,29 @@ if test x$DEVMAPPER = xyes; then
 fi
 
 ################################################################################
+dnl -- Build lvmetad
+AC_MSG_CHECKING(whether to build LVMetaD)
+AC_ARG_ENABLE(lvmetad,
+	      AC_HELP_STRING([--enable-lvmetad],
+			     [enable the LVM Metadata Daemon]),
+	      LVMETAD=$enableval)
+AC_MSG_RESULT($LVMETAD)
+
+BUILD_LVMETAD=$LVMETAD
+
+if test x$BUILD_LVMETAD = xyes; then
+	AC_DEFINE([LVMETAD_SUPPORT], 1, [Define to 1 to include code that uses lvmetad.])
+
+	AC_ARG_WITH(lvmetad-pidfile,
+		    AC_HELP_STRING([--with-lvmetad-pidfile=PATH],
+				   [lvmetad pidfile [[PID_DIR/lvmetad.pid]]]),
+		    LVMETAD_PIDFILE=$withval,
+		    LVMETAD_PIDFILE="$DEFAULT_PID_DIR/lvmetad.pid")
+	AC_DEFINE_UNQUOTED(LVMETAD_PIDFILE, ["$LVMETAD_PIDFILE"],
+			   [Path to lvmetad pidfile.])
+fi
+
+################################################################################
 dnl -- Enable udev synchronisation
 AC_MSG_CHECKING(whether to enable synchronisation with udev processing)
 AC_ARG_ENABLE(udev_sync,
@@ -786,9 +925,11 @@ AC_ARG_ENABLE(udev_sync,
 AC_MSG_RESULT($UDEV_SYNC)
 
 if test x$UDEV_SYNC = xyes; then
-	AC_CHECK_LIB(udev, udev_queue_get_udev_is_active,
-		     [UDEV_PC="libudev"; UDEV_LIBS="-ludev"],
-		     [AC_MSG_ERROR([bailing out... libudev library is required])])
+	dnl -- init pkgconfig if required
+	if  test x$PKGCONFIG_INIT != x1; then
+		pkg_config_init
+	fi
+	PKG_CHECK_MODULES(UDEV, libudev >= 143, [UDEV_PC="libudev"])
 	AC_DEFINE([UDEV_SYNC_SUPPORT], 1, [Define to 1 to enable synchronisation with udev processing.])
 fi
 
@@ -800,12 +941,37 @@ AC_ARG_ENABLE(udev_rules,
 	      UDEV_RULES=$enableval, UDEV_RULES=$UDEV_SYNC)
 AC_MSG_RESULT($UDEV_RULES)
 
+AC_MSG_CHECKING(whether to enable executable path detection in udev rules)
+AC_ARG_ENABLE(udev_rule_exec_detection,
+	      AC_HELP_STRING([--enable-udev-rule-exec-detection],
+			     [enable executable path detection in udev rules]),
+	      UDEV_RULE_EXEC_DETECTION=$enableval, UDEV_RULE_EXEC_DETECTION=no)
+AC_MSG_RESULT($UDEV_RULE_EXEC_DETECTION)
+
+dnl -- Check support for built-in blkid against target udev version
+AC_MSG_CHECKING(whether udev supports built-in blkid)
+test x$PKGCONFIG_INIT != x1 && pkg_config_init
+if $($PKG_CONFIG --atleast-version=176 libudev); then
+	UDEV_HAS_BUILTIN_BLKID=yes
+else
+	UDEV_HAS_BUILTIN_BLKID=no
+fi
+AC_MSG_RESULT($UDEV_HAS_BUILTIN_BLKID)
+
 ################################################################################
 dnl -- Compatibility mode
 AC_ARG_ENABLE(compat,
 	      AC_HELP_STRING([--enable-compat],
 			     [enable support for old device-mapper versions]),
 	      DM_COMPAT=$enableval, DM_COMPAT=no)
+
+if test x$DM_COMPAT = xyes; then
+	AC_MSG_ERROR(
+                 [--enable-compat is not currently supported.
+Since device-mapper version 1.02.66, only one version (4) of the device-mapper 
+ioctl protocol is supported.]
+	)
+fi
 
 ################################################################################
 dnl -- Compatible units suffix mode
@@ -863,6 +1029,40 @@ test x$CMDLIB = xyes \
   || LVM2CMD_LIB=
 
 ################################################################################
+dnl -- Enable Python liblvm2app bindings
+AC_MSG_CHECKING(whether to build Python wrapper for liblvm2app.so)
+AC_ARG_ENABLE(python_bindings,
+	      AC_HELP_STRING([--enable-python_bindings], [build Python applib bindings]),
+	      PYTHON_BINDINGS=$enableval, PYTHON_BINDINGS=no)
+AC_MSG_RESULT($PYTHON_BINDINGS)
+
+if test x$PYTHON_BINDINGS = xyes; then
+	if test x$APPLIB != xyes; then
+		AC_MSG_ERROR(
+			--enable-python_bindings requires --enable-applib
+		)
+	fi
+
+	AC_PATH_PROG(PYTHON, python, notfound)
+	if test x$PYTHON == xnotfound; then
+		AC_MSG_ERROR(
+[python is required for --enable-python_bindings but cannot be found]
+		)
+	fi
+
+	AC_PATH_PROG(PYTHON_CONFIG, python-config, notfound)
+	if test x$PYTHON_CONFIG == xnotfound; then
+		AC_MSG_ERROR(
+[python headers are required for --enable-python_bindings but cannot be found]
+		)
+	fi
+
+	PYTHON_INCDIRS=`$PYTHON_CONFIG --includes`
+	PYTHON_LIBDIRS=`$PYTHON_CONFIG --libs`
+
+fi
+
+################################################################################
 dnl -- Enable pkg-config
 AC_ARG_ENABLE(pkgconfig,
 	      AC_HELP_STRING([--enable-pkgconfig], [install pkgconfig support]),
@@ -881,6 +1081,13 @@ AC_MSG_CHECKING(whether to install fsadm)
 AC_ARG_ENABLE(fsadm, AC_HELP_STRING([--disable-fsadm], [disable fsadm]),
 	      FSADM=$enableval)
 AC_MSG_RESULT($FSADM)
+
+################################################################################
+dnl -- Enable blkdeactivate
+AC_MSG_CHECKING(whether to install blkdeactivate)
+AC_ARG_ENABLE(blkdeactivate, AC_HELP_STRING([--disable-blkdeactivate], [disable blkdeactivate]),
+	      BLKDEACTIVATE=$enableval)
+AC_MSG_RESULT($BLKDEACTIVATE)
 
 ################################################################################
 dnl -- enable dmeventd handling
@@ -942,6 +1149,7 @@ AC_CHECK_LIB(dl, dlopen, [
 dnl -- Check for shared/static conflicts
 if [[ \( "x$LVM1" = xshared -o "x$POOL" = xshared -o "x$CLUSTER" = xshared \
       -o "x$SNAPSHOTS" = xshared -o "x$MIRRORS" = xshared \
+      -o "x$RAID" = xshared \
       \) -a "x$STATIC_LINK" = xyes ]];
  then  AC_MSG_ERROR(
 Features cannot be 'shared' when building statically
@@ -1100,6 +1308,34 @@ AC_ARG_WITH(udevdir,
 	    udevdir=$withval, udevdir='${udev_prefix}/lib/udev/rules.d')
 
 ################################################################################
+dnl -- Get the systemd system unit dir value from pkg_config automatically if value not given explicitly.
+dnl -- This follows the recommendation for systemd integration best practices mentioned in daemon(7) manpage.
+AC_ARG_WITH(systemdsystemunitdir,
+	    AC_HELP_STRING([--with-systemdsystemunitdir=DIR],
+			   [systemd service files in DIR]),
+	    systemdsystemunitdir=$withval,
+	    dnl -- init pkgconfig if required
+	    test x$PKGCONFIG_INIT != x1 && pkg_config_init
+	    pkg_systemdsystemunitdir=$($PKG_CONFIG --variable=systemdsystemunitdir systemd))
+
+if test -n "$pkg_systemdsystemunitdir"; then
+	    systemdsystemunitdir=$pkg_systemdsystemunitdir;
+fi
+
+if test -z "$systemdsystemunitdir"; then
+	    systemdsystemunitdir='${exec_prefix}/lib/systemd/system';
+fi
+
+systemdutildir=$($PKG_CONFIG --variable=systemdutildir systemd)
+if test -z "$systemdutildir"; then
+	    systemdutildir='${exec_prefix}/lib/systemd';
+fi
+################################################################################
+AC_ARG_WITH(tmpfilesdir,
+	    AC_HELP_STRING([--with-tmpfilesdir=DIR],
+			   [install configuration files for management of volatile files and directories in DIR [[PREFIX/lib/tmpfiles.d]]]),
+			   tmpfilesdir=$withval, tmpfilesdir='${prefix}/lib/tmpfiles.d')
+################################################################################
 dnl -- Ensure additional headers required
 if test x$READLINE = xyes; then
 	AC_CHECK_HEADERS(readline/readline.h readline/history.h,,AC_MSG_ERROR(bailing out))
@@ -1144,13 +1380,14 @@ fi
 lvm_exec_prefix=$exec_prefix
 test "$lvm_exec_prefix" = NONE && lvm_exec_prefix=$prefix
 test "$lvm_exec_prefix" = NONE && lvm_exec_prefix=$ac_default_prefix
-AC_DEFINE_UNQUOTED(LVM_PATH, ["$lvm_exec_prefix/sbin/lvm"], [Path to lvm binary.])
+LVM_PATH="$lvm_exec_prefix/sbin/lvm"
+AC_DEFINE_UNQUOTED(LVM_PATH, ["$LVM_PATH"], [Path to lvm binary.])
 
 if  test "$CLVMD" != none; then
         clvmd_prefix=$ac_default_prefix
+        CLVMD_PATH="$clvmd_prefix/sbin/clvmd"
         test "$prefix" != NONE && clvmd_prefix=$prefix
-	AC_DEFINE_UNQUOTED(CLVMD_PATH, ["$clvmd_prefix/sbin/clvmd"],
-			   [Path to clvmd binary.])
+	AC_DEFINE_UNQUOTED(CLVMD_PATH, ["$CLVMD_PATH"], [Path to clvmd binary.])
 fi
 
 ################################################################################
@@ -1158,9 +1395,9 @@ dnl -- dmeventd pidfile and executable path
 if test "$BUILD_DMEVENTD" = yes; then
 	AC_ARG_WITH(dmeventd-pidfile,
 		    AC_HELP_STRING([--with-dmeventd-pidfile=PATH],
-				   [dmeventd pidfile [[/var/run/dmeventd.pid]]]),
+				   [dmeventd pidfile [[PID_DIR/dmeventd.pid]]]),
 		    DMEVENTD_PIDFILE=$withval,
-		    DMEVENTD_PIDFILE="/var/run/dmeventd.pid")
+		    DMEVENTD_PIDFILE="$DEFAULT_PID_DIR/dmeventd.pid")
 	AC_DEFINE_UNQUOTED(DMEVENTD_PIDFILE, ["$DMEVENTD_PIDFILE"],
 			   [Path to dmeventd pidfile.])
 fi
@@ -1174,13 +1411,6 @@ if test "$BUILD_DMEVENTD" = yes; then
 	AC_DEFINE_UNQUOTED(DMEVENTD_PATH, ["$DMEVENTD_PATH"],
 			   [Path to dmeventd binary.])
 fi
-
-AH_TEMPLATE(DEFAULT_RUN_DIR, [Name of default run directory.])
-AC_ARG_WITH(default-run-dir,
-	    [  --with-default-run-dir=DIR       Default run directory [[/var/run/lvm]] ],
-	    [ DEFAULT_RUN_DIR="$withval" ],
-	    [ DEFAULT_RUN_DIR="/var/run/lvm" ])
-AC_DEFINE_UNQUOTED(DEFAULT_RUN_DIR,["$DEFAULT_RUN_DIR"] )
 
 ################################################################################
 dnl -- various defaults
@@ -1264,8 +1494,7 @@ AC_SUBST(APPLIB)
 AC_SUBST(AWK)
 AC_SUBST(BUILD_CMIRRORD)
 AC_SUBST(BUILD_DMEVENTD)
-AC_SUBST(CCS_CFLAGS)
-AC_SUBST(CCS_LIBS)
+AC_SUBST(BUILD_LVMETAD)
 AC_SUBST(CFLAGS)
 AC_SUBST(CFLOW_CMD)
 AC_SUBST(CLDFLAGS)
@@ -1274,8 +1503,11 @@ AC_SUBST(CLDWHOLEARCHIVE)
 AC_SUBST(CLUSTER)
 AC_SUBST(CLVMD)
 AC_SUBST(CLVMD_CMANAGERS)
+AC_SUBST(CLVMD_PATH)
 AC_SUBST(CMAN_CFLAGS)
 AC_SUBST(CMAN_LIBS)
+AC_SUBST(CMAP_CFLAGS)
+AC_SUBST(CMAP_LIBS)
 AC_SUBST(CMDLIB)
 AC_SUBST(CONFDB_CFLAGS)
 AC_SUBST(CONFDB_LIBS)
@@ -1291,6 +1523,7 @@ AC_SUBST(DEFAULT_BACKUP_SUBDIR)
 AC_SUBST(DEFAULT_CACHE_SUBDIR)
 AC_SUBST(DEFAULT_DATA_ALIGNMENT)
 AC_SUBST(DEFAULT_LOCK_DIR)
+AC_SUBST(DEFAULT_DM_RUN_DIR)
 AC_SUBST(DEFAULT_RUN_DIR)
 AC_SUBST(DEVMAPPER)
 AC_SUBST(DLM_CFLAGS)
@@ -1305,9 +1538,9 @@ AC_SUBST(DM_DEVICE_UID)
 AC_SUBST(DM_IOCTLS)
 AC_SUBST(DM_LIB_VERSION)
 AC_SUBST(DM_LIB_PATCHLEVEL)
+AC_SUBST(ELDFLAGS)
 AC_SUBST(FSADM)
-AC_SUBST(GULM_CFLAGS)
-AC_SUBST(GULM_LIBS)
+AC_SUBST(BLKDEACTIVATE)
 AC_SUBST(HAVE_LIBDL)
 AC_SUBST(HAVE_REALTIME)
 AC_SUBST(INTL)
@@ -1324,18 +1557,25 @@ AC_SUBST(LVM_LIBAPI)
 AC_SUBST(LVM_MAJOR)
 AC_SUBST(LVM_MINOR)
 AC_SUBST(LVM_PATCHLEVEL)
+AC_SUBST(LVM_PATH)
 AC_SUBST(LVM_RELEASE)
 AC_SUBST(LVM_RELEASE_DATE)
 AC_SUBST(MIRRORS)
-AC_SUBST(OCF)
-AC_SUBST(REPLICATORS)
 AC_SUBST(MSGFMT)
+AC_SUBST(OCF)
+AC_SUBST(OCFDIR)
 AC_SUBST(PKGCONFIG)
 AC_SUBST(POOL)
 AC_SUBST(PTHREAD_LIBS)
+AC_SUBST(PYTHON)
+AC_SUBST(PYTHON_BINDINGS)
+AC_SUBST(PYTHON_INCDIRS)
+AC_SUBST(PYTHON_LIBDIRS)
 AC_SUBST(QUORUM_CFLAGS)
 AC_SUBST(QUORUM_LIBS)
+AC_SUBST(RAID)
 AC_SUBST(READLINE_LIBS)
+AC_SUBST(REPLICATORS)
 AC_SUBST(SACKPT_CFLAGS)
 AC_SUBST(SACKPT_LIBS)
 AC_SUBST(SALCK_CFLAGS)
@@ -1346,11 +1586,19 @@ AC_SUBST(SNAPSHOTS)
 AC_SUBST(STATICDIR)
 AC_SUBST(STATIC_LINK)
 AC_SUBST(TESTING)
+AC_SUBST(THIN)
+AC_SUBST(THIN_CHECK_CMD)
 AC_SUBST(UDEV_LIBS)
 AC_SUBST(UDEV_PC)
 AC_SUBST(UDEV_RULES)
 AC_SUBST(UDEV_SYNC)
+AC_SUBST(UDEV_RULE_EXEC_DETECTION)
+AC_SUBST(UDEV_HAS_BUILTIN_BLKID)
+AC_SUBST(CUNIT_LIBS)
+AC_SUBST(CUNIT_CFLAGS)
 AC_SUBST(WRITE_INSTALL)
+AC_SUBST(DMEVENTD_PIDFILE)
+AC_SUBST(LVMETAD_PIDFILE)
 AC_SUBST(interface)
 AC_SUBST(kerneldir)
 AC_SUBST(missingkernel)
@@ -1358,6 +1606,9 @@ AC_SUBST(kernelvsn)
 AC_SUBST(tmpdir)
 AC_SUBST(udev_prefix)
 AC_SUBST(udevdir)
+AC_SUBST(systemdsystemunitdir)
+AC_SUBST(systemdutildir)
+AC_SUBST(tmpfilesdir)
 AC_SUBST(usrlibdir)
 AC_SUBST(usrsbindir)
 
@@ -1374,8 +1625,11 @@ daemons/dmeventd/Makefile
 daemons/dmeventd/libdevmapper-event.pc
 daemons/dmeventd/plugins/Makefile
 daemons/dmeventd/plugins/lvm2/Makefile
+daemons/dmeventd/plugins/raid/Makefile
 daemons/dmeventd/plugins/mirror/Makefile
 daemons/dmeventd/plugins/snapshot/Makefile
+daemons/dmeventd/plugins/thin/Makefile
+daemons/lvmetad/Makefile
 doc/Makefile
 doc/example.conf
 include/.symlinks
@@ -1387,19 +1641,37 @@ lib/locking/Makefile
 lib/mirror/Makefile
 lib/replicator/Makefile
 lib/misc/lvm-version.h
+lib/raid/Makefile
 lib/snapshot/Makefile
+lib/thin/Makefile
+libdaemon/Makefile
+libdaemon/client/Makefile
+libdaemon/server/Makefile
 libdm/Makefile
 libdm/libdevmapper.pc
 liblvm/Makefile
 liblvm/liblvm2app.pc
 man/Makefile
 po/Makefile
+python/Makefile
+python/setup.py
+scripts/blkdeactivate.sh
+scripts/blk_availability_init_red_hat
+scripts/blk_availability_systemd_red_hat.service
 scripts/clvmd_init_red_hat
 scripts/cmirrord_init_red_hat
+scripts/lvm2_lvmetad_init_red_hat
+scripts/lvm2_lvmetad_systemd_red_hat.socket
+scripts/lvm2_lvmetad_systemd_red_hat.service
 scripts/lvm2_monitoring_init_red_hat
+scripts/dm_event_systemd_red_hat.socket
+scripts/dm_event_systemd_red_hat.service
+scripts/lvm2_monitoring_systemd_red_hat.service
+scripts/lvm2_tmpfiles_red_hat.conf
 scripts/Makefile
 test/Makefile
 test/api/Makefile
+test/unit/Makefile
 tools/Makefile
 udev/Makefile
 unit-tests/datastruct/Makefile

@@ -125,6 +125,7 @@ static void _build_inverse(void)
 	if (_built_inverse)
 		return;
 
+	_built_inverse = 1;
 	memset(_inverse_c, 0, sizeof(_inverse_c));
 
 	for (ptr = _c; *ptr; ptr++)
@@ -157,7 +158,7 @@ int id_write_format(const struct id *id, char *buffer, size_t size)
 {
 	int i, tot;
 
-	static unsigned group_size[] = { 6, 4, 4, 4, 4, 4, 6 };
+	static const unsigned group_size[] = { 6, 4, 4, 4, 4, 4, 6 };
 
 	assert(ID_LEN == 32);
 

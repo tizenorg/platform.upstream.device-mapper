@@ -59,14 +59,10 @@ struct dm_event_handler *dm_event_handler_create(void)
 {
 	struct dm_event_handler *dmevh = NULL;
 
-	if (!(dmevh = dm_malloc(sizeof(*dmevh))))
+	if (!(dmevh = dm_zalloc(sizeof(*dmevh)))) {
+		log_error("Failed to allocate event handler.");
 		return NULL;
-
-	dmevh->dmeventd_path = NULL;
-	dmevh->dso = dmevh->dev_name = dmevh->uuid = NULL;
-	dmevh->major = dmevh->minor = 0;
-	dmevh->mask = 0;
-	dmevh->timeout = 0;
+	}
 
 	return dmevh;
 }
@@ -245,6 +241,10 @@ static int _daemon_read(struct dm_event_fifos *fifos,
 				log_error("Unable to read from event server");
 				return 0;
 			}
+			if ((ret == 0) && (i > 4) && !bytes) {
+				log_error("No input from event server.");
+				return 0;
+			}
 		}
 		if (ret < 1) {
 			log_error("Unable to read from event server.");
@@ -309,7 +309,7 @@ static int _daemon_write(struct dm_event_fifos *fifos,
 		}
 		if (ret == 0)
 			break;
-		read(fifos->server, drainbuf, 127);
+		ret = read(fifos->server, drainbuf, 127);
 	}
 
 	while (bytes < size) {
@@ -424,30 +424,27 @@ static int _start_daemon(char *dmeventd_path, struct dm_event_fifos *fifos)
 	fifos->client = open(fifos->client_path, O_WRONLY | O_NONBLOCK);
 	if (fifos->client >= 0) {
 		/* server is running and listening */
-
-		close(fifos->client);
+		if (close(fifos->client))
+			log_sys_error("close", fifos->client_path);
 		return 1;
 	} else if (errno != ENXIO) {
 		/* problem */
-
-		log_error("%s: Can't open client fifo %s: %s",
-			  __func__, fifos->client_path, strerror(errno));
-		stack;
+		log_sys_error("open", fifos->client_path);
 		return 0;
 	}
 
       start_server:
 	/* server is not running */
 
-	if (!strncmp(DMEVENTD_PATH, "/", 1) && stat(DMEVENTD_PATH, &statbuf)) {
-		log_error("Unable to find dmeventd.");
-		return_0;
+	if ((args[0][0] == '/') && stat(args[0], &statbuf)) {
+		log_sys_error("stat", args[0]);
+		return 0;
 	}
 
 	pid = fork();
 
 	if (pid < 0)
-		log_error("Unable to fork.");
+		log_sys_error("fork", "");
 
 	else if (!pid) {
 		execvp(args[0], args);
@@ -477,25 +474,23 @@ int init_fifos(struct dm_event_fifos *fifos)
 
 	/* Open the fifo used to read from the daemon. */
 	if ((fifos->server = open(fifos->server_path, O_RDWR)) < 0) {
-		log_error("%s: open server fifo %s",
-			  __func__, fifos->server_path);
-		stack;
+		log_sys_error("open", fifos->server_path);
 		return 0;
 	}
 
 	/* Lock out anyone else trying to do communication with the daemon. */
 	if (flock(fifos->server, LOCK_EX) < 0) {
-		log_error("%s: flock %s", __func__, fifos->server_path);
-		close(fifos->server);
+		log_sys_error("flock", fifos->server_path);
+		if (close(fifos->server))
+			log_sys_error("close", fifos->server_path);
 		return 0;
 	}
 
 /*	if ((fifos->client = open(fifos->client_path, O_WRONLY | O_NONBLOCK)) < 0) {*/
 	if ((fifos->client = open(fifos->client_path, O_RDWR | O_NONBLOCK)) < 0) {
-		log_error("%s: Can't open client fifo %s: %s",
-			  __func__, fifos->client_path, strerror(errno));
-		close(fifos->server);
-		stack;
+		log_sys_error("open", fifos->client_path);
+		if (close(fifos->server))
+			log_sys_error("close", fifos->server_path);
 		return 0;
 	}
 
@@ -523,8 +518,10 @@ void fini_fifos(struct dm_event_fifos *fifos)
 	if (flock(fifos->server, LOCK_UN))
 		log_error("flock unlock %s", fifos->server_path);
 
-	close(fifos->client);
-	close(fifos->server);
+	if (close(fifos->client))
+		log_sys_error("close", fifos->client_path);
+	if (close(fifos->server))
+		log_sys_error("close", fifos->server_path);
 }
 
 /* Get uuid of a device */
@@ -538,34 +535,46 @@ static struct dm_task *_get_device_info(const struct dm_event_handler *dmevh)
 		return NULL;
 	}
 
-	if (dmevh->uuid)
-		dm_task_set_uuid(dmt, dmevh->uuid);
-	else if (dmevh->dev_name)
-		dm_task_set_name(dmt, dmevh->dev_name);
-	else if (dmevh->major && dmevh->minor) {
-		dm_task_set_major(dmt, dmevh->major);
-		dm_task_set_minor(dmt, dmevh->minor);
-        }
+	if (dmevh->uuid) {
+		if (!dm_task_set_uuid(dmt, dmevh->uuid))
+			goto_bad;
+	} else if (dmevh->dev_name) {
+		if (!dm_task_set_name(dmt, dmevh->dev_name))
+			goto_bad;
+	} else if (dmevh->major && dmevh->minor) {
+		if (!dm_task_set_major(dmt, dmevh->major) ||
+		    !dm_task_set_minor(dmt, dmevh->minor))
+			goto_bad;
+	}
 
 	/* FIXME Add name or uuid or devno to messages */
 	if (!dm_task_run(dmt)) {
 		log_error("_get_device_info: dm_task_run() failed");
-		goto failed;
+		goto bad;
 	}
 
 	if (!dm_task_get_info(dmt, &info)) {
 		log_error("_get_device_info: failed to get info for device");
-		goto failed;
+		goto bad;
 	}
 
 	if (!info.exists) {
-		log_error("_get_device_info: device not found");
-		goto failed;
+		log_error("_get_device_info: %s%s%s%.0d%s%.0d%s%s: device not found",
+			  dmevh->uuid ? : "", 
+			  (!dmevh->uuid && dmevh->dev_name) ? dmevh->dev_name : "", 
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->major > 0) ? "(" : "",
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->major > 0) ? dmevh->major : 0,
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->major > 0) ? ":" : "",
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->minor > 0) ? dmevh->minor : 0,
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->major > 0) && dmevh->minor == 0 ? "0" : "",
+			  (!dmevh->uuid && !dmevh->dev_name && dmevh->major > 0) ? ") " : "");
+		goto bad;
 	}
 
+		  
 	return dmt;
 
-failed:
+      bad:
 	dm_task_destroy(dmt);
 	return NULL;
 }
@@ -715,16 +724,17 @@ int dm_event_get_registered_device(struct dm_event_handler *dmevh, int next)
 
 	uuid = dm_task_get_uuid(dmt);
 
-	if (!(ret = _do_event(next ? DM_EVENT_CMD_GET_NEXT_REGISTERED_DEVICE :
-			     DM_EVENT_CMD_GET_REGISTERED_DEVICE, dmevh->dmeventd_path,
-			      &msg, dmevh->dso, uuid, dmevh->mask, 0))) {
-		/* FIXME this will probably horribly break if we get
-		   ill-formatted reply */
-		ret = _parse_message(&msg, &reply_dso, &reply_uuid, &reply_mask);
-	} else {
+	if (_do_event(next ? DM_EVENT_CMD_GET_NEXT_REGISTERED_DEVICE :
+		      DM_EVENT_CMD_GET_REGISTERED_DEVICE, dmevh->dmeventd_path,
+		      &msg, dmevh->dso, uuid, dmevh->mask, 0)) {
+		log_debug("%s: device not registered.", dm_task_get_name(dmt));
 		ret = -ENOENT;
 		goto fail;
 	}
+
+	/* FIXME this will probably horribly break if we get
+	   ill-formatted reply */
+	ret = _parse_message(&msg, &reply_dso, &reply_uuid, &reply_mask);
 
 	dm_task_destroy(dmt);
 	dmt = NULL;
@@ -733,6 +743,10 @@ int dm_event_get_registered_device(struct dm_event_handler *dmevh, int next)
 	msg.data = NULL;
 
 	_dm_event_handler_clear_dev_info(dmevh);
+	if (!reply_uuid) {
+		ret = -ENXIO; /* dmeventd probably gave us bogus uuid back */
+		goto fail;
+	}
 	dmevh->uuid = dm_strdup(reply_uuid);
 	if (!dmevh->uuid) {
 		ret = -ENOMEM;
@@ -779,6 +793,36 @@ int dm_event_get_registered_device(struct dm_event_handler *dmevh, int next)
 	if (dmt)
 		dm_task_destroy(dmt);
 	return ret;
+}
+
+/*
+ * You can (and have to) call this at the stage of the protocol where
+ *     daemon_talk(fifos, &msg, DM_EVENT_CMD_HELLO, NULL, NULL, 0, 0)
+ *
+ * would be normally sent. This call will parse the version reply from
+ * dmeventd, in addition to above call. It is not safe to call this at any
+ * other place in the protocol.
+ *
+ * This is an internal function, not exposed in the public API.
+ */
+
+int dm_event_get_version(struct dm_event_fifos *fifos, int *version) {
+	char *p;
+	struct dm_event_daemon_message msg = { 0, 0, NULL };
+
+	if (daemon_talk(fifos, &msg, DM_EVENT_CMD_HELLO, NULL, NULL, 0, 0))
+		return 0;
+	p = msg.data;
+	*version = 0;
+
+	p = strchr(p, ' '); /* Message ID */
+        if (!p) return 0;
+	p = strchr(p + 1, ' '); /* HELLO */
+        if (!p) return 0;
+	p = strchr(p + 1, ' '); /* HELLO, once more */
+	if (p)
+		*version = atoi(p);
+	return 1;
 }
 
 #if 0				/* left out for now */

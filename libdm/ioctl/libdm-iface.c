@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2007 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of the device-mapper userspace tools.
  *
@@ -16,10 +16,6 @@
 #include "dmlib.h"
 #include "libdm-targets.h"
 #include "libdm-common.h"
-
-#ifdef DM_COMPAT
-#  include "libdm-compat.h"
-#endif
 
 #include <fcntl.h>
 #include <dirent.h>
@@ -44,8 +40,7 @@
  * in the _cmd_data arrays.
  */
 
-#if !((DM_VERSION_MAJOR == 1 && DM_VERSION_MINOR >= 0) || \
-      (DM_VERSION_MAJOR == 4 && DM_VERSION_MINOR >= 0))
+#if !((DM_VERSION_MAJOR == 4 && DM_VERSION_MINOR >= 6))
 #error The version of dm-ioctl.h included is incompatible.
 #endif
 
@@ -73,9 +68,9 @@ static unsigned _dm_version_minor = 0;
 static unsigned _dm_version_patchlevel = 0;
 static int _log_suppress = 0;
 
-static int _kernel_major;
-static int _kernel_minor;
-static int _kernel_release;
+static int _kernel_major = 0;
+static int _kernel_minor = 0;
+static int _kernel_release = 0;
 
 /*
  * If the kernel dm driver only supports one major number
@@ -92,16 +87,7 @@ static int _version_checked = 0;
 static int _version_ok = 1;
 static unsigned _ioctl_buffer_double_factor = 0;
 
-/*
- * Support both old and new major numbers to ease the transition.
- * Clumsy, but only temporary.
- */
-#if DM_VERSION_MAJOR == 4 && defined(DM_COMPAT)
-const int _dm_compat = 1;
-#else
 const int _dm_compat = 0;
-#endif
-
 
 /* *INDENT-OFF* */
 static struct cmd_data _cmd_data_v4[] = {
@@ -133,7 +119,6 @@ static struct cmd_data _cmd_data_v4[] = {
 };
 /* *INDENT-ON* */
 
-#define ALIGNMENT_V1 sizeof(int)
 #define ALIGNMENT 8
 
 /* FIXME Rejig library to record & use errno instead */
@@ -141,17 +126,18 @@ static struct cmd_data _cmd_data_v4[] = {
 #  define DM_EXISTS_FLAG 0x00000004
 #endif
 
-static void *_align(void *ptr, unsigned int a)
+static char *_align(char *ptr, unsigned int a)
 {
 	register unsigned long agn = --a;
 
-	return (void *) (((unsigned long) ptr + agn) & ~agn);
+	return (char *) (((unsigned long) ptr + agn) & ~agn);
 }
 
 static int _uname(void)
 {
 	static int _uts_set = 0;
 	struct utsname _uts;
+	int parts;
 
 	if (_uts_set)
 		return 1;
@@ -160,10 +146,14 @@ static int _uname(void)
 		log_error("uname failed: %s", strerror(errno));
 		return 0;
 	}
-	if (sscanf(_uts.release, "%d.%d.%d",
+
+	parts = sscanf(_uts.release, "%d.%d.%d",
 			&_kernel_major,
 			&_kernel_minor,
-			&_kernel_release) != 3) {
+			&_kernel_release);
+
+	/* Kernels with a major number of 2 always had 3 parts. */
+	if (parts < 1 || (_kernel_major < 3 && parts < 3)) {
 		log_error("Could not determine kernel version used.");
 		return 0;
 	}
@@ -182,7 +172,8 @@ static int _get_proc_number(const char *file, const char *name,
 {
 	FILE *fl;
 	char nm[256];
-	int c;
+	char *line = NULL;
+	size_t len;
 	uint32_t num;
 
 	if (!(fl = fopen(file, "r"))) {
@@ -190,23 +181,23 @@ static int _get_proc_number(const char *file, const char *name,
 		return 0;
 	}
 
-	while (!feof(fl)) {
-		if (fscanf(fl, "%d %255s\n", &num, &nm[0]) == 2) {
+	while (getline(&line, &len, fl) != -1) {
+		if (sscanf(line, "%d %255s\n", &num, &nm[0]) == 2) {
 			if (!strcmp(name, nm)) {
 				if (number) {
 					*number = num;
 					if (fclose(fl))
 						log_sys_error("fclose", file);
+					free(line);
 					return 1;
 				}
 				dm_bit_set(_dm_bitset, num);
 			}
-		} else do {
-			c = fgetc(fl);
-		} while (c != EOF && c != '\n');
+		}
 	}
 	if (fclose(fl))
 		log_sys_error("fclose", file);
+	free(line);
 
 	if (number) {
 		log_error("%s: No entry for %s found", file, name);
@@ -228,7 +219,7 @@ static int _control_device_number(uint32_t *major, uint32_t *minor)
 }
 
 /*
- * Returns 1 if exists; 0 if it doesn't; -1 if it's wrong
+ * Returns 1 if it exists on returning; 0 if it doesn't; -1 if it's wrong.
  */
 static int _control_exists(const char *control, uint32_t major, uint32_t minor)
 {
@@ -248,7 +239,7 @@ static int _control_exists(const char *control, uint32_t major, uint32_t minor)
 		return -1;
 	}
 
-	if (major && buf.st_rdev != MKDEV(major, minor)) {
+	if (major && buf.st_rdev != MKDEV((dev_t)major, minor)) {
 		log_verbose("%s: Wrong device number: (%u, %u) instead of "
 			    "(%u, %u)", control,
 			    MAJOR(buf.st_mode), MINOR(buf.st_mode),
@@ -267,8 +258,15 @@ static int _create_control(const char *control, uint32_t major, uint32_t minor)
 	int ret;
 	mode_t old_umask;
 
-	if (!major)
-		return 0;
+	/*
+	 * Return if the control already exists with intended major/minor
+	 * or there's an error unlinking an apparently incorrect one.
+	 */
+	ret = _control_exists(control, major, minor);
+	if (ret == -1)
+		return 0;	/* Failed to unlink existing incorrect node */
+	if (ret)
+		return 1;	/* Already exists and correct */
 
 	(void) dm_prepare_selinux_context(dm_dir(), S_IFDIR);
 	old_umask = umask(DM_DEV_DIR_UMASK);
@@ -282,12 +280,14 @@ static int _create_control(const char *control, uint32_t major, uint32_t minor)
 	log_verbose("Creating device %s (%u, %u)", control, major, minor);
 
 	(void) dm_prepare_selinux_context(control, S_IFCHR);
+	old_umask = umask(DM_CONTROL_NODE_UMASK);
 	if (mknod(control, S_IFCHR | S_IRUSR | S_IWUSR,
-		  MKDEV(major, minor)) < 0)  {
+		  MKDEV((dev_t)major, minor)) < 0)  {
 		log_sys_error("mknod", control);
 		(void) dm_prepare_selinux_context(NULL, 0);
 		return 0;
 	}
+	umask(old_umask);
 	(void) dm_prepare_selinux_context(NULL, 0);
 
 	return 1;
@@ -357,14 +357,10 @@ static void _close_control_fd(void)
 	}
 }
 
-static int _open_and_assign_control_fd(const char *control,
-				       int ignore_nodev)
+static int _open_and_assign_control_fd(const char *control)
 {
-	_close_control_fd();
-
 	if ((_control_fd = open(control, O_RDWR)) < 0) {
-		if (!(ignore_nodev && errno == ENODEV))
-			log_sys_error("open", control);
+		log_sys_error("open", control);
 		return 0;
 	}
 
@@ -375,8 +371,8 @@ static int _open_control(void)
 {
 #ifdef DM_IOCTLS
 	char control[PATH_MAX];
-	uint32_t major = 0, minor;
-	int dm_mod_autoload_support, needs_open;
+	uint32_t major = MISC_MAJOR;
+	uint32_t minor = MAPPER_CTRL_MINOR;
 
 	if (_control_fd != -1)
 		return 1;
@@ -387,61 +383,27 @@ static int _open_control(void)
 	snprintf(control, sizeof(control), "%s/%s", dm_dir(), DM_CONTROL_NODE);
 
 	/*
-	 * dm-mod autoloading is supported since kernel 2.6.36.
-	 * Udev daemon will try to read modules.devname file extracted
-	 * by depmod and create any static nodes needed.
-	 * The /dev/mapper/control node can be created and prepared this way.
-	 * First access to such node should load dm-mod module automatically.
+	 * Prior to 2.6.36 the minor number should be looked up in /proc.
 	 */
-	dm_mod_autoload_support = KERNEL_VERSION(_kernel_major, _kernel_minor,
-				  _kernel_release) >= KERNEL_VERSION(2, 6, 36);
+	if ((KERNEL_VERSION(_kernel_major, _kernel_minor, _kernel_release) <
+	     KERNEL_VERSION(2, 6, 36)) &&
+	    !_control_device_number(&major, &minor))
+		goto_bad;
 
 	/*
-	 *  If dm-mod autoloading is supported and the control node exists
-	 *  already try to open it now. This should autoload dm-mod module.
+	 * Create the node with correct major and minor if not already done.
+	 * Udev may already have created /dev/mapper/control
+	 * from the modules.devname file generated by depmod.
 	 */
-	if (dm_mod_autoload_support) {
-		if (!_get_proc_number(PROC_DEVICES, MISC_NAME, &major))
-			/* If major not found, just fallback to hardcoded value. */
-			major = MISC_MAJOR;
-
-		/* Recreate the node with correct major and minor if needed. */
-		if (!_control_exists(control, major, MAPPER_CTRL_MINOR) &&
-		    !_create_control(control, major, MAPPER_CTRL_MINOR))
-			goto error;
-
-		_open_and_assign_control_fd(control, 1);
-	}
+	if (!_create_control(control, major, minor))
+		goto_bad;
 
 	/*
-	 * Get major and minor number assigned for the control node.
-	 * In case we make use of the module autoload support, this
-	 * information should be accessible now as well.
+	 * As of 2.6.36 kernels, the open can trigger autoloading dm-mod.
 	 */
-	if (!_control_device_number(&major, &minor))
-		log_error("Is device-mapper driver missing from kernel?");
-
-	/*
-	 * Check the control node and its major and minor number.
-	 * If there's anything wrong, remove the old node and create
-	 * a correct one.
-	 */
-	if ((needs_open = !_control_exists(control, major, minor)) &&
-	    !_create_control(control, major, minor)) {
-		_close_control_fd();
-		goto error;
-	}
-
-	/*
-	 * For older kernels without dm-mod autoloading support, we always
-	 * need to open the control node here - we still haven't done that!
-	 * For newer kernels with dm-mod autoloading, we open it only if the
-	 * node was recreated and corrected in previous step.
-	 */
-	if ((!dm_mod_autoload_support || needs_open) &&
-	     !_open_and_assign_control_fd(control, 0))
-		goto error;
-
+	if (!_open_and_assign_control_fd(control))
+		goto_bad;
+	
 	if (!_create_dm_bitset()) {
 		log_error("Failed to set up list of device-mapper major numbers");
 		return 0;
@@ -449,8 +411,10 @@ static int _open_control(void)
 
 	return 1;
 
-error:
+bad:
 	log_error("Failure to communicate with kernel device-mapper driver.");
+	if (!geteuid())
+		log_error("Check that device-mapper is available in the kernel.");
 	return 0;
 #else
 	return 1;
@@ -484,425 +448,16 @@ void dm_task_destroy(struct dm_task *dmt)
 		dm_free(t);
 	}
 
-	if (dmt->dev_name)
-		dm_free(dmt->dev_name);
-
-	if (dmt->newname)
-		dm_free(dmt->newname);
-
-	if (dmt->message)
-		dm_free(dmt->message);
-
 	_dm_zfree_dmi(dmt->dmi.v4);
-
-	if (dmt->uuid)
-		dm_free(dmt->uuid);
-
+	dm_free(dmt->dev_name);
+	dm_free(dmt->mangled_dev_name);
+	dm_free(dmt->newname);
+	dm_free(dmt->message);
+	dm_free(dmt->geometry);
+	dm_free(dmt->uuid);
+	dm_free(dmt->mangled_uuid);
 	dm_free(dmt);
 }
-
-/*
- * Protocol Version 1 compatibility functions.
- */
-
-#ifdef DM_COMPAT
-
-static void _dm_zfree_dmi_v1(struct dm_ioctl_v1 *dmi)
-{
-	if (dmi) {
-		memset(dmi, 0, dmi->data_size);
-		dm_free(dmi);
-	}
-}
-
-static int _dm_task_get_driver_version_v1(struct dm_task *dmt, char *version,
-					  size_t size)
-{
-	unsigned int *v;
-
-	if (!dmt->dmi.v1) {
-		version[0] = '\0';
-		return 0;
-	}
-
-	v = dmt->dmi.v1->version;
-	snprintf(version, size, "%u.%u.%u", v[0], v[1], v[2]);
-	return 1;
-}
-
-/* Unmarshall the target info returned from a status call */
-static int _unmarshal_status_v1(struct dm_task *dmt, struct dm_ioctl_v1 *dmi)
-{
-	char *outbuf = (char *) dmi + dmi->data_start;
-	char *outptr = outbuf;
-	int32_t i;
-	struct dm_target_spec_v1 *spec;
-
-	for (i = 0; i < dmi->target_count; i++) {
-		spec = (struct dm_target_spec_v1 *) outptr;
-
-		if (!dm_task_add_target(dmt, spec->sector_start,
-					(uint64_t) spec->length,
-					spec->target_type,
-					outptr + sizeof(*spec))) {
-			return 0;
-		}
-
-		outptr = outbuf + spec->next;
-	}
-
-	return 1;
-}
-
-static int _dm_format_dev_v1(char *buf, int bufsize, uint32_t dev_major,
-			     uint32_t dev_minor)
-{
-	int r;
-
-	if (bufsize < 8)
-		return 0;
-
-	r = snprintf(buf, bufsize, "%03x:%03x", dev_major, dev_minor);
-	if (r < 0 || r > bufsize - 1)
-		return 0;
-
-	return 1;
-}
-
-static int _dm_task_get_info_v1(struct dm_task *dmt, struct dm_info *info)
-{
-	if (!dmt->dmi.v1)
-		return 0;
-
-	memset(info, 0, sizeof(*info));
-
-	info->exists = dmt->dmi.v1->flags & DM_EXISTS_FLAG ? 1 : 0;
-	if (!info->exists)
-		return 1;
-
-	info->suspended = dmt->dmi.v1->flags & DM_SUSPEND_FLAG ? 1 : 0;
-	info->read_only = dmt->dmi.v1->flags & DM_READONLY_FLAG ? 1 : 0;
-	info->target_count = dmt->dmi.v1->target_count;
-	info->open_count = dmt->dmi.v1->open_count;
-	info->event_nr = 0;
-	info->major = MAJOR(dmt->dmi.v1->dev);
-	info->minor = MINOR(dmt->dmi.v1->dev);
-	info->live_table = 1;
-	info->inactive_table = 0;
-
-	return 1;
-}
-
-static const char *_dm_task_get_name_v1(const struct dm_task *dmt)
-{
-	return (dmt->dmi.v1->name);
-}
-
-static const char *_dm_task_get_uuid_v1(const struct dm_task *dmt)
-{
-	return (dmt->dmi.v1->uuid);
-}
-
-static struct dm_deps *_dm_task_get_deps_v1(struct dm_task *dmt)
-{
-	log_error("deps version 1 no longer supported by libdevmapper");
-	return NULL;
-}
-
-static struct dm_names *_dm_task_get_names_v1(struct dm_task *dmt)
-{
-	return (struct dm_names *) (((void *) dmt->dmi.v1) +
-				    dmt->dmi.v1->data_start);
-}
-
-static void *_add_target_v1(struct target *t, void *out, void *end)
-{
-	void *out_sp = out;
-	struct dm_target_spec_v1 sp;
-	size_t sp_size = sizeof(struct dm_target_spec_v1);
-	int len;
-
-	out += sp_size;
-	if (out >= end)
-		return_NULL;
-
-	sp.status = 0;
-	sp.sector_start = t->start;
-	sp.length = t->length;
-	strncpy(sp.target_type, t->type, sizeof(sp.target_type));
-
-	len = strlen(t->params);
-
-	if ((out + len + 1) >= end)
-		return_NULL;
-
-	strcpy((char *) out, t->params);
-	out += len + 1;
-
-	/* align next block */
-	out = _align(out, ALIGNMENT_V1);
-
-	sp.next = out - out_sp;
-
-	memcpy(out_sp, &sp, sp_size);
-
-	return out;
-}
-
-static struct dm_ioctl_v1 *_flatten_v1(struct dm_task *dmt)
-{
-	const size_t min_size = 16 * 1024;
-	const int (*version)[3];
-
-	struct dm_ioctl_v1 *dmi;
-	struct target *t;
-	size_t len = sizeof(struct dm_ioctl_v1);
-	void *b, *e;
-	int count = 0;
-
-	for (t = dmt->head; t; t = t->next) {
-		len += sizeof(struct dm_target_spec_v1);
-		len += strlen(t->params) + 1 + ALIGNMENT_V1;
-		count++;
-	}
-
-	if (count && dmt->newname) {
-		log_error("targets and newname are incompatible");
-		return NULL;
-	}
-
-	if (dmt->newname)
-		len += strlen(dmt->newname) + 1;
-
-	/*
-	 * Give len a minimum size so that we have space to store
-	 * dependencies or status information.
-	 */
-	if (len < min_size)
-		len = min_size;
-
-	if (!(dmi = dm_malloc(len)))
-		return NULL;
-
-	memset(dmi, 0, len);
-
-	version = &_cmd_data_v1[dmt->type].version;
-
-	dmi->version[0] = (*version)[0];
-	dmi->version[1] = (*version)[1];
-	dmi->version[2] = (*version)[2];
-
-	dmi->data_size = len;
-	dmi->data_start = sizeof(struct dm_ioctl_v1);
-
-	if (dmt->dev_name)
-		strncpy(dmi->name, dmt->dev_name, sizeof(dmi->name));
-
-	if (dmt->type == DM_DEVICE_SUSPEND)
-		dmi->flags |= DM_SUSPEND_FLAG;
-	if (dmt->read_only)
-		dmi->flags |= DM_READONLY_FLAG;
-
-	if (dmt->minor >= 0) {
-		if (dmt->major <= 0) {
-			log_error("Missing major number for persistent device");
-			return NULL;
-		}
-		dmi->flags |= DM_PERSISTENT_DEV_FLAG;
-		dmi->dev = MKDEV(dmt->major, dmt->minor);
-	}
-
-	if (dmt->uuid)
-		strncpy(dmi->uuid, dmt->uuid, sizeof(dmi->uuid));
-
-	dmi->target_count = count;
-
-	b = (void *) (dmi + 1);
-	e = (void *) ((char *) dmi + len);
-
-	for (t = dmt->head; t; t = t->next)
-		if (!(b = _add_target_v1(t, b, e))) {
-			log_error("Ran out of memory building ioctl parameter");
-			goto bad;
-		}
-
-	if (dmt->newname)
-		strcpy(b, dmt->newname);
-
-	return dmi;
-
-      bad:
-	_dm_zfree_dmi_v1(dmi);
-	return NULL;
-}
-
-static int _dm_names_v1(struct dm_ioctl_v1 *dmi)
-{
-	const char *dev_dir = dm_dir();
-	int r = 1, len;
-	const char *name;
-	struct dirent *dirent;
-	DIR *d;
-	struct dm_names *names, *old_names = NULL;
-	void *end = (void *) dmi + dmi->data_size;
-	struct stat buf;
-	char path[PATH_MAX];
-
-	log_warn("WARNING: Device list may be incomplete with interface "
-		  "version 1.");
-	log_warn("Please upgrade your kernel device-mapper driver.");
-
-	if (!(d = opendir(dev_dir))) {
-		log_sys_error("opendir", dev_dir);
-		return 0;
-	}
-
-	names = (struct dm_names *) ((void *) dmi + dmi->data_start);
-
-	names->dev = 0;		/* Flags no data */
-
-	while ((dirent = readdir(d))) {
-		name = dirent->d_name;
-
-		if (name[0] == '.' || !strcmp(name, "control"))
-			continue;
-
-		if (old_names)
-			old_names->next = (uint32_t) ((void *) names -
-						      (void *) old_names);
-		snprintf(path, sizeof(path), "%s/%s", dev_dir, name);
-		if (stat(path, &buf)) {
-			log_sys_error("stat", path);
-			continue;
-		}
-		if (!S_ISBLK(buf.st_mode))
-			continue;
-		names->dev = (uint64_t) buf.st_rdev;
-		names->next = 0;
-		len = strlen(name);
-		if (((void *) (names + 1) + len + 1) >= end) {
-			log_error("Insufficient buffer space for device list");
-			r = 0;
-			break;
-		}
-
-		strcpy(names->name, name);
-
-		old_names = names;
-		names = _align((void *) ++names + len + 1, ALIGNMENT);
-	}
-
-	if (closedir(d))
-		log_sys_error("closedir", dev_dir);
-
-	return r;
-}
-
-static int _dm_task_run_v1(struct dm_task *dmt)
-{
-	struct dm_ioctl_v1 *dmi;
-	unsigned int command;
-
-	dmi = _flatten_v1(dmt);
-	if (!dmi) {
-		log_error("Couldn't create ioctl argument.");
-		return 0;
-	}
-
-	if (!_open_control())
-		return 0;
-
-	if ((unsigned) dmt->type >=
-	    (sizeof(_cmd_data_v1) / sizeof(*_cmd_data_v1))) {
-		log_error(INTERNAL_ERROR "unknown device-mapper task %d",
-			  dmt->type);
-		goto bad;
-	}
-
-	command = _cmd_data_v1[dmt->type].cmd;
-
-	if (dmt->type == DM_DEVICE_TABLE)
-		dmi->flags |= DM_STATUS_TABLE_FLAG;
-
-	if (dmt->new_uuid) {
-		log_error("Changing UUID is not supported by kernel.");
-		goto bad;
-	}
-
-	log_debug("dm %s %s %s%s%s [%u]", _cmd_data_v1[dmt->type].name,
-		  dmi->name, dmi->uuid, dmt->newname ? " " : "",
-		  dmt->newname ? dmt->newname : "",
-		  dmi->data_size);
-	if (dmt->type == DM_DEVICE_LIST) {
-		if (!_dm_names_v1(dmi))
-			goto bad;
-	} 
-#ifdef DM_IOCTLS
-	else if (ioctl(_control_fd, command, dmi) < 0) {
-		if (_log_suppress)
-			log_verbose("device-mapper: %s ioctl failed: %s", 
-				    _cmd_data_v1[dmt->type].name,
-				    strerror(errno));
-		else
-			log_error("device-mapper: %s ioctl failed: %s",
-				  _cmd_data_v1[dmt->type].name,
-				  strerror(errno));
-		goto bad;
-	}
-#else /* Userspace alternative for testing */
-#endif
-
-	if (dmi->flags & DM_BUFFER_FULL_FLAG)
-		/* FIXME Increase buffer size and retry operation (if query) */
-		log_error("WARNING: libdevmapper buffer too small for data");
-
-	switch (dmt->type) {
-	case DM_DEVICE_CREATE:
-		add_dev_node(dmt->dev_name, MAJOR(dmi->dev), MINOR(dmi->dev),
-			     dmt->uid, dmt->gid, dmt->mode, 0);
-		break;
-
-	case DM_DEVICE_REMOVE:
-		rm_dev_node(dmt->dev_name, 0);
-		break;
-
-	case DM_DEVICE_RENAME:
-		rename_dev_node(dmt->dev_name, dmt->newname, 0);
-		break;
-
-	case DM_DEVICE_MKNODES:
-		if (dmi->flags & DM_EXISTS_FLAG)
-			add_dev_node(dmt->dev_name, MAJOR(dmi->dev),
-				     MINOR(dmi->dev), dmt->uid,
-				     dmt->gid, dmt->mode, 0);
-		else
-			rm_dev_node(dmt->dev_name, 0);
-		break;
-
-	case DM_DEVICE_STATUS:
-	case DM_DEVICE_TABLE:
-		if (!_unmarshal_status_v1(dmt, dmi))
-			goto bad;
-		break;
-
-	case DM_DEVICE_SUSPEND:
-	case DM_DEVICE_RESUME:
-		dmt->type = DM_DEVICE_INFO;
-		if (!dm_task_run(dmt))
-			goto bad;
-		_dm_zfree_dmi_v1(dmi);	/* We'll use what info returned */
-		return 1;
-	}
-
-	dmt->dmi.v1 = dmi;
-	return 1;
-
-      bad:
-	_dm_zfree_dmi_v1(dmi);
-	return 0;
-}
-
-#endif
 
 /*
  * Protocol Version 4 functions.
@@ -912,20 +467,22 @@ int dm_task_get_driver_version(struct dm_task *dmt, char *version, size_t size)
 {
 	unsigned *v;
 
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_driver_version_v1(dmt, version, size);
-#endif
-
 	if (!dmt->dmi.v4) {
-		version[0] = '\0';
+		if (version)
+			version[0] = '\0';
 		return 0;
 	}
 
 	v = dmt->dmi.v4->version;
-	snprintf(version, size, "%u.%u.%u", v[0], v[1], v[2]);
 	_dm_version_minor = v[1];
 	_dm_version_patchlevel = v[2];
+	if (version &&
+	    (snprintf(version, size, "%u.%u.%u", v[0], v[1], v[2]) < 0)) {
+		log_error("Buffer for version is to short.");
+		if (size > 0)
+			version[0] = '\0';
+		return 0;
+	}
 
 	return 1;
 }
@@ -945,7 +502,8 @@ static int _check_version(char *version, size_t size, int log_suppress)
 		_log_suppress = 1;
 
 	r = dm_task_run(task);
-	dm_task_get_driver_version(task, version, size);
+	if (!dm_task_get_driver_version(task, version, size))
+		stack;
 	dm_task_destroy(task);
 	_log_suppress = 0;
 
@@ -970,7 +528,7 @@ int dm_check_version(void)
 		return 1;
 
 	if (!_dm_compat)
-		goto bad;
+		goto_bad;
 
 	log_verbose("device-mapper ioctl protocol version %u failed. "
 		    "Trying protocol version 1.", _dm_version);
@@ -995,8 +553,25 @@ int dm_check_version(void)
 int dm_cookie_supported(void)
 {
 	return (dm_check_version() &&
-	        _dm_version >= 4 &&
-	        _dm_version_minor >= 15);
+		_dm_version >= 4 &&
+		_dm_version_minor >= 15);
+}
+
+static int dm_inactive_supported(void)
+{
+	int inactive_supported = 0;
+
+	if (dm_check_version() && _dm_version >= 4) {
+		if (_dm_version_minor >= 16)
+			inactive_supported = 1; /* upstream */
+		else if (_dm_version_minor == 11 &&
+			 (_dm_version_patchlevel >= 6 &&
+			  _dm_version_patchlevel <= 40)) {
+			inactive_supported = 1; /* RHEL 5.7 */
+		}
+	}
+
+	return inactive_supported;
 }
 
 void *dm_get_next_target(struct dm_task *dmt, void *next,
@@ -1008,8 +583,13 @@ void *dm_get_next_target(struct dm_task *dmt, void *next,
 	if (!t)
 		t = dmt->head;
 
-	if (!t)
+	if (!t) {
+		*start = 0;
+		*length = 0;
+		*target_type = 0;
+		*params = 0;
 		return NULL;
+	}
 
 	*start = t->start;
 	*length = t->length;
@@ -1047,11 +627,6 @@ int dm_format_dev(char *buf, int bufsize, uint32_t dev_major,
 {
 	int r;
 
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_format_dev_v1(buf, bufsize, dev_major, dev_minor);
-#endif
-
 	if (bufsize < 8)
 		return 0;
 
@@ -1064,11 +639,6 @@ int dm_format_dev(char *buf, int bufsize, uint32_t dev_major,
 
 int dm_task_get_info(struct dm_task *dmt, struct dm_info *info)
 {
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_info_v1(dmt, info);
-#endif
-
 	if (!dmt->dmi.v4)
 		return 0;
 
@@ -1093,70 +663,33 @@ int dm_task_get_info(struct dm_task *dmt, struct dm_info *info)
 }
 
 uint32_t dm_task_get_read_ahead(const struct dm_task *dmt, uint32_t *read_ahead)
-{              
+{
 	const char *dev_name;
 
 	*read_ahead = 0;
 
-#ifdef DM_COMPAT
-	/* Not supporting this */
-        if (_dm_version == 1)
-                return 1;
-#endif  
-
-        if (!dmt->dmi.v4 || !(dmt->dmi.v4->flags & DM_EXISTS_FLAG))
+	if (!dmt->dmi.v4 || !(dmt->dmi.v4->flags & DM_EXISTS_FLAG))
 		return 0;
 
 	if (*dmt->dmi.v4->name)
 		dev_name = dmt->dmi.v4->name;
-	else if (dmt->dev_name)
-		dev_name = dmt->dev_name;
-	else {
+	else if (!(dev_name = DEV_NAME(dmt))) {
 		log_error("Get read ahead request failed: device name unrecorded.");
 		return 0;
 	}
 
-	return get_dev_node_read_ahead(dev_name, read_ahead);
-}
-
-const char *dm_task_get_name(const struct dm_task *dmt)
-{
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_name_v1(dmt);
-#endif
-
-	return (dmt->dmi.v4->name);
-}
-
-const char *dm_task_get_uuid(const struct dm_task *dmt)
-{
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_uuid_v1(dmt);
-#endif
-
-	return (dmt->dmi.v4->uuid);
+	return get_dev_node_read_ahead(dev_name, MAJOR(dmt->dmi.v4->dev),
+				       MINOR(dmt->dmi.v4->dev), read_ahead);
 }
 
 struct dm_deps *dm_task_get_deps(struct dm_task *dmt)
 {
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_deps_v1(dmt);
-#endif
-
 	return (struct dm_deps *) (((char *) dmt->dmi.v4) +
 				   dmt->dmi.v4->data_start);
 }
 
 struct dm_names *dm_task_get_names(struct dm_task *dmt)
 {
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_get_names_v1(dmt);
-#endif
-
 	return (struct dm_names *) (((char *) dmt->dmi.v4) +
 				    dmt->dmi.v4->data_start);
 }
@@ -1188,11 +721,45 @@ int dm_task_suppress_identical_reload(struct dm_task *dmt)
 	return 1;
 }
 
+int dm_task_set_add_node(struct dm_task *dmt, dm_add_node_t add_node)
+{
+	switch (add_node) {
+	case DM_ADD_NODE_ON_RESUME:
+	case DM_ADD_NODE_ON_CREATE:
+		dmt->add_node = add_node;
+		return 1;
+	default:
+		log_error("Unknown add node parameter");
+		return 0;
+	}
+}
+
 int dm_task_set_newuuid(struct dm_task *dmt, const char *newuuid)
 {
+	dm_string_mangling_t mangling_mode = dm_get_name_mangling_mode();
+	char mangled_uuid[DM_UUID_LEN];
+	int r = 0;
+
 	if (strlen(newuuid) >= DM_UUID_LEN) {
 		log_error("Uuid \"%s\" too long", newuuid);
 		return 0;
+	}
+
+	if (!check_multiple_mangled_string_allowed(newuuid, "new UUID", mangling_mode))
+		return_0;
+
+	if (mangling_mode != DM_STRING_MANGLING_NONE &&
+	    (r = mangle_string(newuuid, "new UUID", strlen(newuuid), mangled_uuid,
+			       sizeof(mangled_uuid), mangling_mode)) < 0) {
+		log_error("Failed to mangle new device UUID \"%s\"", newuuid);
+		return 0;
+	}
+
+	if (r) {
+		log_debug("New device uuid mangled [%s]: %s --> %s",
+			  mangling_mode == DM_STRING_MANGLING_AUTO ? "auto" : "hex",
+			  newuuid, mangled_uuid);
+		newuuid = mangled_uuid;
 	}
 
 	if (!(dmt->newname = dm_strdup(newuuid))) {
@@ -1200,27 +767,6 @@ int dm_task_set_newuuid(struct dm_task *dmt, const char *newuuid)
 		return 0;
 	}
 	dmt->new_uuid = 1;
-
-	return 1;
-}
-
-int dm_task_set_newname(struct dm_task *dmt, const char *newname)
-{
-	if (strchr(newname, '/')) {
-		log_error("Name \"%s\" invalid. It contains \"/\".", newname);
-		return 0;
-	}
-
-	if (strlen(newname) >= DM_NAME_LEN) {
-		log_error("Name \"%s\" too long", newname);
-		return 0;
-	}
-
-	if (!(dmt->newname = dm_strdup(newname))) {
-		log_error("dm_task_set_newname: strdup(%s) failed", newname);
-		return 0;
-	}
-	dmt->new_uuid = 0;
 
 	return 1;
 }
@@ -1242,16 +788,11 @@ int dm_task_set_sector(struct dm_task *dmt, uint64_t sector)
 	return 1;
 }
 
-int dm_task_set_geometry(struct dm_task *dmt, const char *cylinders, const char *heads, const char *sectors, const char *start)
+int dm_task_set_geometry(struct dm_task *dmt, const char *cylinders, const char *heads,
+			 const char *sectors, const char *start)
 {
-	size_t len = strlen(cylinders) + 1 + strlen(heads) + 1 + strlen(sectors) + 1 + strlen(start) + 1;
-
-	if (!(dmt->geometry = dm_malloc(len))) {
-		log_error("dm_task_set_geometry: dm_malloc failed");
-		return 0;
-	}
-
-	if (sprintf(dmt->geometry, "%s %s %s %s", cylinders, heads, sectors, start) < 0) {
+	if (dm_asprintf(&(dmt->geometry), "%s %s %s %s",
+			cylinders, heads, sectors, start) < 0) {
 		log_error("dm_task_set_geometry: sprintf failed");
 		return 0;
 	}
@@ -1280,6 +821,20 @@ int dm_task_skip_lockfs(struct dm_task *dmt)
 	return 1;
 }
 
+int dm_task_secure_data(struct dm_task *dmt)
+{
+	dmt->secure_data = 1;
+
+	return 1;
+}
+
+int dm_task_retry_remove(struct dm_task *dmt)
+{
+	dmt->retry_remove = 1;
+
+	return 1;
+}
+
 int dm_task_query_inactive_table(struct dm_task *dmt)
 {
 	dmt->query_inactive_table = 1;
@@ -1297,15 +852,18 @@ int dm_task_set_event_nr(struct dm_task *dmt, uint32_t event_nr)
 struct target *create_target(uint64_t start, uint64_t len, const char *type,
 			     const char *params)
 {
-	struct target *t = dm_malloc(sizeof(*t));
+	struct target *t;
 
-	if (!t) {
+	if (strlen(type) >= DM_MAX_TYPE_NAME) {
+		log_error("Target type name %s is too long.", type);
+		return NULL;
+	}
+
+	if (!(t = dm_zalloc(sizeof(*t)))) {
 		log_error("create_target: malloc(%" PRIsize_t ") failed",
 			  sizeof(*t));
 		return NULL;
 	}
-
-	memset(t, 0, sizeof(*t));
 
 	if (!(t->params = dm_strdup(params))) {
 		log_error("create_target: strdup(params) failed");
@@ -1328,29 +886,53 @@ struct target *create_target(uint64_t start, uint64_t len, const char *type,
 	return NULL;
 }
 
-static void *_add_target(struct target *t, void *out, void *end)
+static char *_add_target(struct target *t, char *out, char *end)
 {
-	void *out_sp = out;
+	char *out_sp = out;
 	struct dm_target_spec sp;
 	size_t sp_size = sizeof(struct dm_target_spec);
+	unsigned int backslash_count = 0;
 	int len;
+	char *pt;
 
-	out += sp_size;
-	if (out >= end)
-		return_NULL;
+	if (strlen(t->type) >= sizeof(sp.target_type)) {
+		log_error("Target type name %s is too long.", t->type);
+		return NULL;
+	}
 
 	sp.status = 0;
 	sp.sector_start = t->start;
 	sp.length = t->length;
-	strncpy(sp.target_type, t->type, sizeof(sp.target_type));
+	strncpy(sp.target_type, t->type, sizeof(sp.target_type) - 1);
+	sp.target_type[sizeof(sp.target_type) - 1] = '\0';
 
-	len = strlen(t->params);
+	out += sp_size;
+	pt = t->params;
 
-	if ((out + len + 1) >= end)
-		return_NULL;
+	while (*pt)
+		if (*pt++ == '\\')
+			backslash_count++;
+	len = strlen(t->params) + backslash_count;
 
-	strcpy((char *) out, t->params);
-	out += len + 1;
+	if ((out >= end) || (out + len + 1) >= end) {
+		log_error("Ran out of memory building ioctl parameter");
+		return NULL;
+	}
+
+	if (backslash_count) {
+		/* replace "\" with "\\" */
+		pt = t->params;
+		do {
+			if (*pt == '\\')
+				*out++ = '\\';
+			*out++ = *pt++;
+		} while (*pt);
+		*out++ = '\0';
+	}
+	else {
+		strcpy(out, t->params);
+		out += len + 1;
+	}
 
 	/* align next block */
 	out = _align(out, ALIGNMENT);
@@ -1381,7 +963,7 @@ static int _lookup_dev_name(uint64_t dev, char *buf, size_t len)
 		goto out;
  
 	do {
-		names = (void *) names + next;
+		names = (struct dm_names *)((char *) names + next);
 		if (names->dev == dev) {
 			strncpy(buf, names->name, len);
 			r = 1;
@@ -1404,7 +986,7 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 	struct target *t;
 	struct dm_target_msg *tmsg;
 	size_t len = sizeof(struct dm_ioctl);
-	void *b, *e;
+	char *b, *e;
 	int count = 0;
 
 	for (t = dmt->head; t; t = t->next) {
@@ -1497,11 +1079,11 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 		}
 
 		dmi->flags |= DM_PERSISTENT_DEV_FLAG;
-		dmi->dev = MKDEV(dmt->major, dmt->minor);
+		dmi->dev = MKDEV((dev_t)dmt->major, dmt->minor);
 	}
 
 	/* Does driver support device number referencing? */
-	if (_dm_version_minor < 3 && !dmt->dev_name && !dmt->uuid && dmi->dev) {
+	if (_dm_version_minor < 3 && !DEV_NAME(dmt) && !DEV_UUID(dmt) && dmi->dev) {
 		if (!_lookup_dev_name(dmi->dev, dmi->name, sizeof(dmi->name))) {
 			log_error("Unable to find name for device (%" PRIu32
 				  ":%" PRIu32 ")", dmt->major, dmt->minor);
@@ -1513,12 +1095,12 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 	}
 
 	/* FIXME Until resume ioctl supplies name, use dev_name for readahead */
-	if (dmt->dev_name && (dmt->type != DM_DEVICE_RESUME || dmt->minor < 0 ||
+	if (DEV_NAME(dmt) && (dmt->type != DM_DEVICE_RESUME || dmt->minor < 0 ||
 			      dmt->major < 0))
-		strncpy(dmi->name, dmt->dev_name, sizeof(dmi->name));
+		strncpy(dmi->name, DEV_NAME(dmt), sizeof(dmi->name));
 
-	if (dmt->uuid)
-		strncpy(dmi->uuid, dmt->uuid, sizeof(dmi->uuid));
+	if (DEV_UUID(dmt))
+		strncpy(dmi->uuid, DEV_UUID(dmt), sizeof(dmi->uuid));
 
 	if (dmt->type == DM_DEVICE_SUSPEND)
 		dmi->flags |= DM_SUSPEND_FLAG;
@@ -1528,8 +1110,14 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 		dmi->flags |= DM_READONLY_FLAG;
 	if (dmt->skip_lockfs)
 		dmi->flags |= DM_SKIP_LOCKFS_FLAG;
+	if (dmt->secure_data) {
+		if (_dm_version_minor < 20)
+			log_verbose("Secure data flag unsupported by kernel. "
+				    "Buffers will not be wiped after use.");
+		dmi->flags |= DM_SECURE_DATA_FLAG;
+	}
 	if (dmt->query_inactive_table) {
-		if (_dm_version_minor < 16)
+		if (!dm_inactive_supported())
 			log_warn("WARNING: Inactive table query unsupported "
 				 "by kernel.  It will use live table.");
 		dmi->flags |= DM_QUERY_INACTIVE_TABLE_FLAG;
@@ -1546,14 +1134,12 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 	dmi->target_count = count;
 	dmi->event_nr = dmt->event_nr;
 
-	b = (void *) (dmi + 1);
-	e = (void *) ((char *) dmi + len);
+	b = (char *) (dmi + 1);
+	e = (char *) dmi + len;
 
 	for (t = dmt->head; t; t = t->next)
-		if (!(b = _add_target(t, b, e))) {
-			log_error("Ran out of memory building ioctl parameter");
-			goto bad;
-		}
+		if (!(b = _add_target(t, b, e)))
+			goto_bad;
 
 	if (dmt->newname)
 		strcpy(b, dmt->newname);
@@ -1633,7 +1219,7 @@ static int _process_all_v4(struct dm_task *dmt)
 		goto out;
 
 	do {
-		names = (void *) names + next;
+		names = (struct dm_names *)((char *) names + next);
 		if (!dm_task_set_name(dmt, names->name)) {
 			r = 0;
 			goto out;
@@ -1691,23 +1277,16 @@ static int _create_and_load_v4(struct dm_task *dmt)
 
 	/* Use new task struct to create the device */
 	if (!(task = dm_task_create(DM_DEVICE_CREATE))) {
-		log_error("Failed to create device-mapper task struct");
 		_udev_complete(dmt);
-		return 0;
+		return_0;
 	}
 
 	/* Copy across relevant fields */
-	if (dmt->dev_name && !dm_task_set_name(task, dmt->dev_name)) {
-		dm_task_destroy(task);
-		_udev_complete(dmt);
-		return 0;
-	}
+	if (dmt->dev_name && !dm_task_set_name(task, dmt->dev_name))
+		goto_bad;
 
-	if (dmt->uuid && !dm_task_set_uuid(task, dmt->uuid)) {
-		dm_task_destroy(task);
-		_udev_complete(dmt);
-		return 0;
-	}
+	if (dmt->uuid && !dm_task_set_uuid(task, dmt->uuid))
+		goto_bad;
 
 	task->major = dmt->major;
 	task->minor = dmt->minor;
@@ -1717,40 +1296,41 @@ static int _create_and_load_v4(struct dm_task *dmt)
 	/* FIXME: Just for udev_check in dm_task_run. Can we avoid this? */
 	task->event_nr = dmt->event_nr & DM_UDEV_FLAGS_MASK;
 	task->cookie_set = dmt->cookie_set;
+	task->add_node = dmt->add_node;
 
-	r = dm_task_run(task);
+	if (!dm_task_run(task))
+		goto_bad;
+
 	dm_task_destroy(task);
-	if (!r) {
-		_udev_complete(dmt);
-		return 0;
-	}
 
 	/* Next load the table */
 	if (!(task = dm_task_create(DM_DEVICE_RELOAD))) {
-		log_error("Failed to create device-mapper task struct");
+		stack;
 		_udev_complete(dmt);
-		r = 0;
 		goto revert;
 	}
 
 	/* Copy across relevant fields */
 	if (dmt->dev_name && !dm_task_set_name(task, dmt->dev_name)) {
+		stack;
 		dm_task_destroy(task);
 		_udev_complete(dmt);
-		r = 0;
 		goto revert;
 	}
 
 	task->read_only = dmt->read_only;
 	task->head = dmt->head;
 	task->tail = dmt->tail;
+	task->secure_data = dmt->secure_data;
 
 	r = dm_task_run(task);
 
 	task->head = NULL;
 	task->tail = NULL;
 	dm_task_destroy(task);
+
 	if (!r) {
+		stack;
 		_udev_complete(dmt);
 		goto revert;
 	}
@@ -1759,16 +1339,18 @@ static int _create_and_load_v4(struct dm_task *dmt)
 	dmt->type = DM_DEVICE_RESUME;
 	dm_free(dmt->uuid);
 	dmt->uuid = NULL;
+	dm_free(dmt->mangled_uuid);
+	dmt->mangled_uuid = NULL;
 
-	r = dm_task_run(dmt);
-
-	if (r)
-		return r;
+	if (dm_task_run(dmt))
+		return 1;
 
       revert:
- 	dmt->type = DM_DEVICE_REMOVE;
+	dmt->type = DM_DEVICE_REMOVE;
 	dm_free(dmt->uuid);
 	dmt->uuid = NULL;
+	dm_free(dmt->mangled_uuid);
+	dmt->mangled_uuid = NULL;
 
 	/*
 	 * Also udev-synchronize "remove" dm task that is a part of this revert!
@@ -1780,13 +1362,19 @@ static int _create_and_load_v4(struct dm_task *dmt)
 		if (!dm_task_set_cookie(dmt, &cookie,
 					(dmt->event_nr & DM_UDEV_FLAGS_MASK) >>
 					DM_UDEV_FLAGS_SHIFT))
-                        stack; /* keep going */
+			stack; /* keep going */
 	}
 
 	if (!dm_task_run(dmt))
 		log_error("Failed to revert device creation.");
 
-	return r;
+	return 0;
+
+      bad:
+	dm_task_destroy(task);
+	_udev_complete(dmt);
+
+	return 0;
 }
 
 uint64_t dm_task_get_existing_table_size(struct dm_task *dmt)
@@ -1798,6 +1386,7 @@ static int _reload_with_suppression_v4(struct dm_task *dmt)
 {
 	struct dm_task *task;
 	struct target *t1, *t2;
+	size_t len;
 	int r;
 
 	/* New task to get existing table information */
@@ -1833,15 +1422,16 @@ static int _reload_with_suppression_v4(struct dm_task *dmt)
 		t2 = t2->next;
 	dmt->existing_table_size = t2 ? t2->start + t2->length : 0;
 
-	if ((task->dmi.v4->flags & DM_READONLY_FLAG) ? 1 : 0 != dmt->read_only)
+	if (((task->dmi.v4->flags & DM_READONLY_FLAG) ? 1 : 0) != dmt->read_only)
 		goto no_match;
 
 	t1 = dmt->head;
 	t2 = task->head;
 
 	while (t1 && t2) {
-		while (t2->params[strlen(t2->params) - 1] == ' ')
-			t2->params[strlen(t2->params) - 1] = '\0';
+		len = strlen(t2->params);
+		while (len-- > 0 && t2->params[len] == ' ')
+			t2->params[len] = '\0';
 		if ((t1->start != t2->start) ||
 		    (t1->length != t2->length) ||
 		    (strcmp(t1->type, t2->type)) ||
@@ -1868,6 +1458,107 @@ no_match:
 	return r;
 }
 
+static int _check_children_not_suspended_v4(struct dm_task *dmt, uint64_t device)
+{
+	struct dm_task *task;
+	struct dm_info info;
+	struct dm_deps *deps;
+	int r = 0;
+	uint32_t i;
+
+	/* Find dependencies */
+	if (!(task = dm_task_create(DM_DEVICE_DEPS)))
+		return 0;
+
+	/* Copy across or set relevant fields */
+	if (device) {
+		task->major = MAJOR(device);
+		task->minor = MINOR(device);
+	} else {
+		if (dmt->dev_name && !dm_task_set_name(task, dmt->dev_name))
+			goto out;
+
+		if (dmt->uuid && !dm_task_set_uuid(task, dmt->uuid))
+			goto out;
+
+		task->major = dmt->major;
+		task->minor = dmt->minor;
+	}
+
+	task->uid = dmt->uid;
+	task->gid = dmt->gid;
+	task->mode = dmt->mode;
+	/* FIXME: Just for udev_check in dm_task_run. Can we avoid this? */
+	task->event_nr = dmt->event_nr & DM_UDEV_FLAGS_MASK;
+	task->cookie_set = dmt->cookie_set;
+	task->add_node = dmt->add_node;
+	
+	if (!(r = dm_task_run(task)))
+		goto out;
+
+	if (!dm_task_get_info(task, &info) || !info.exists)
+		goto out;
+
+	/*
+	 * Warn if any of the devices this device depends upon are already
+	 * suspended: I/O could become trapped between the two devices.
+	 */
+	if (info.suspended) {
+		if (!device)
+			log_debug("Attempting to suspend a device that is already suspended "
+				  "(%u:%u)", info.major, info.minor);
+		else
+			log_error(INTERNAL_ERROR "Attempt to suspend device %s%s%s%.0d%s%.0d%s%s"
+				  "that uses already-suspended device (%u:%u)", 
+				  DEV_NAME(dmt) ? : "", DEV_UUID(dmt) ? : "",
+				  dmt->major > 0 ? "(" : "",
+				  dmt->major > 0 ? dmt->major : 0,
+				  dmt->major > 0 ? ":" : "",
+				  dmt->minor > 0 ? dmt->minor : 0,
+				  dmt->major > 0 && dmt->minor == 0 ? "0" : "",
+				  dmt->major > 0 ? ") " : "",
+				  info.major, info.minor);
+
+		/* No need for further recursion */
+		r = 1;
+		goto out;
+	}
+
+	if (!(deps = dm_task_get_deps(task)))
+		goto out;
+
+	for (i = 0; i < deps->count; i++) {
+		/* Only recurse with dm devices */
+		if (MAJOR(deps->device[i]) != _dm_device_major)
+			continue;
+
+		if (!_check_children_not_suspended_v4(task, deps->device[i]))
+			goto out;
+	}
+
+	r = 1;
+
+out:
+	dm_task_destroy(task);
+
+	return r;
+}
+
+static int _suspend_with_validation_v4(struct dm_task *dmt)
+{
+	/* Avoid recursion */
+	dmt->enable_checks = 0;
+
+	/*
+	 * Ensure we can't leave any I/O trapped between suspended devices.
+	 */
+	if (!_check_children_not_suspended_v4(dmt, 0))
+		return 0;
+
+	/* Finally, perform the original suspend. */
+	return dm_task_run(dmt);
+}
+
 static const char *_sanitise_message(char *message)
 {
 	const char *sanitised_message = message ?: "";
@@ -1880,13 +1571,76 @@ static const char *_sanitise_message(char *message)
 	return sanitised_message;
 }
 
+static int _do_dm_ioctl_unmangle_string(char *str, const char *str_name,
+					char *buf, size_t buf_size,
+					dm_string_mangling_t mode)
+{
+	int r;
+
+	if (mode == DM_STRING_MANGLING_NONE)
+		return 1;
+
+	if (!check_multiple_mangled_string_allowed(str, str_name, mode))
+		return_0;
+
+	if ((r = unmangle_string(str, str_name, strlen(str), buf, buf_size, mode)) < 0) {
+		log_debug("_do_dm_ioctl_unmangle_string: failed to "
+			  "unmangle %s \"%s\"", str_name, str);
+		return 0;
+	} else if (r)
+		memcpy(str, buf, strlen(buf) + 1);
+
+	return 1;
+}
+
+static int _dm_ioctl_unmangle_names(int type, struct dm_ioctl *dmi)
+{
+	char buf[DM_NAME_LEN];
+	struct dm_names *names;
+	unsigned next = 0;
+	char *name;
+	int r = 1;
+
+	if ((name = dmi->name))
+		r = _do_dm_ioctl_unmangle_string(name, "name", buf, sizeof(buf),
+						 dm_get_name_mangling_mode());
+
+	if (type == DM_DEVICE_LIST &&
+	    ((names = ((struct dm_names *) ((char *)dmi + dmi->data_start)))) &&
+	    names->dev) {
+		do {
+			names = (struct dm_names *)((char *) names + next);
+			r = _do_dm_ioctl_unmangle_string(names->name, "name",
+							 buf, sizeof(buf),
+							 dm_get_name_mangling_mode());
+			next = names->next;
+		} while (next);
+	}
+
+	return r;
+}
+
+static int _dm_ioctl_unmangle_uuids(int type, struct dm_ioctl *dmi)
+{
+	char buf[DM_UUID_LEN];
+	char *uuid = dmi->uuid;
+
+	if (uuid)
+		return _do_dm_ioctl_unmangle_string(uuid, "UUID", buf, sizeof(buf),
+						    dm_get_name_mangling_mode());
+
+	return 1;
+}
+
 static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
-				     unsigned repeat_count)
+				     unsigned buffer_repeat_count,
+				     unsigned retry_repeat_count,
+				     int *retryable)
 {
 	struct dm_ioctl *dmi;
 	int ioctl_with_uevent;
 
-	dmi = _flatten(dmt, repeat_count);
+	dmi = _flatten(dmt, buffer_repeat_count);
 	if (!dmi) {
 		log_error("Couldn't create ioctl argument.");
 		return NULL;
@@ -1947,7 +1701,7 @@ static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
 	}
 
 	log_debug("dm %s %s%s %s%s%s %s%.0d%s%.0d%s"
-		  "%s%c%c%s%s %.0" PRIu64 " %s [%u]",
+		  "%s%c%c%s%s%s%s%s%s %.0" PRIu64 " %s [%u] (*%u)",
 		  _cmd_data_v4[dmt->type].name,
 		  dmt->new_uuid ? "UUID " : "",
 		  dmi->name, dmi->uuid, dmt->newname ? " " : "",
@@ -1960,12 +1714,17 @@ static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
 		  dmt->major > 0 ? ") " : "",
 		  dmt->no_open_count ? 'N' : 'O',
 		  dmt->no_flush ? 'N' : 'F',
+		  dmt->read_only ? "R" : "",
 		  dmt->skip_lockfs ? "S " : "",
+		  dmt->retry_remove ? "T " : "",
+		  dmt->secure_data ? "W " : "",
 		  dmt->query_inactive_table ? "I " : "",
+		  dmt->enable_checks ? "C" : "",
 		  dmt->sector, _sanitise_message(dmt->message),
-		  dmi->data_size);
+		  dmi->data_size, retry_repeat_count);
 #ifdef DM_IOCTLS
-	if (ioctl(_control_fd, command, dmi) < 0) {
+	if (ioctl(_control_fd, command, dmi) < 0 &&
+	    dmt->expected_errno != errno) {
 		if (errno == ENXIO && ((dmt->type == DM_DEVICE_INFO) ||
 				       (dmt->type == DM_DEVICE_MKNODES) ||
 				       (dmt->type == DM_DEVICE_STATUS)))
@@ -1977,21 +1736,43 @@ static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
 				    	    _cmd_data_v4[dmt->type].name,
 					    strerror(errno));
 			else
-				log_error("device-mapper: %s ioctl "
+				log_error("device-mapper: %s ioctl on %s "
 					  "failed: %s",
-				    	   _cmd_data_v4[dmt->type].name,
-					  strerror(errno));
-			_dm_zfree_dmi(dmi);
-			return NULL;
+					  _cmd_data_v4[dmt->type].name,
+					  dmi->name, strerror(errno));
+
+			/*
+			 * It's sometimes worth retrying after EBUSY in case
+			 * it's a transient failure caused by an asynchronous
+			 * process quickly scanning the device.
+			 */
+			*retryable = errno == EBUSY;
+
+			goto error;
 		}
 	}
 
-	if (ioctl_with_uevent && !_check_uevent_generated(dmi))
+	if (ioctl_with_uevent && dm_udev_get_sync_support() &&
+	    !_check_uevent_generated(dmi)) {
+		log_debug("Uevent not generated! Calling udev_complete "
+			  "internally to avoid process lock-up.");
 		_udev_complete(dmt);
+	}
+
+	if (!_dm_ioctl_unmangle_names(dmt->type, dmi))
+		goto error;
+
+	if (dmt->type != DM_DEVICE_REMOVE &&
+	    !_dm_ioctl_unmangle_uuids(dmt->type, dmi))
+		goto error;
 
 #else /* Userspace alternative for testing */
 #endif
 	return dmi;
+
+error:
+	_dm_zfree_dmi(dmi);
+	return NULL;
 }
 
 void dm_task_update_nodes(void)
@@ -1999,17 +1780,20 @@ void dm_task_update_nodes(void)
 	update_devs();
 }
 
+#define DM_IOCTL_RETRIES 25
+#define DM_RETRY_USLEEP_DELAY 200000
+
 int dm_task_run(struct dm_task *dmt)
 {
 	struct dm_ioctl *dmi;
 	unsigned command;
 	int check_udev;
-	int udev_only;
-
-#ifdef DM_COMPAT
-	if (_dm_version == 1)
-		return _dm_task_run_v1(dmt);
-#endif
+	int rely_on_udev;
+	int suspended_counter;
+	unsigned ioctl_retry = 1;
+	int retryable = 0;
+	const char *dev_name = DEV_NAME(dmt);
+	const char *dev_uuid = DEV_UUID(dmt);
 
 	if ((unsigned) dmt->type >=
 	    (sizeof(_cmd_data_v4) / sizeof(*_cmd_data_v4))) {
@@ -2024,21 +1808,53 @@ int dm_task_run(struct dm_task *dmt)
 	if (dmt->type == DM_DEVICE_CREATE && dmt->head)
 		return _create_and_load_v4(dmt);
 
-	if (dmt->type == DM_DEVICE_MKNODES && !dmt->dev_name &&
-	    !dmt->uuid && dmt->major <= 0)
+	if (dmt->type == DM_DEVICE_MKNODES && !dev_name &&
+	    !dev_uuid && dmt->major <= 0)
 		return _mknodes_v4(dmt);
 
 	if ((dmt->type == DM_DEVICE_RELOAD) && dmt->suppress_identical_reload)
 		return _reload_with_suppression_v4(dmt);
 
+	if ((dmt->type == DM_DEVICE_SUSPEND) && dmt->enable_checks)
+		return _suspend_with_validation_v4(dmt);
+
 	if (!_open_control()) {
 		_udev_complete(dmt);
-		return 0;
+		return_0;
 	}
+
+	if ((suspended_counter = dm_get_suspended_counter()) &&
+	    dmt->type == DM_DEVICE_RELOAD)
+		log_error(INTERNAL_ERROR "Performing unsafe table load while %d device(s) "
+			  "are known to be suspended: "
+			  "%s%s%s %s%.0d%s%.0d%s%s",
+			  suspended_counter,
+			  dev_name ? : "",
+			  dev_uuid ? " UUID " : "",
+			  dev_uuid ? : "",
+			  dmt->major > 0 ? "(" : "",
+			  dmt->major > 0 ? dmt->major : 0,
+			  dmt->major > 0 ? ":" : "",
+			  dmt->minor > 0 ? dmt->minor : 0,
+			  dmt->major > 0 && dmt->minor == 0 ? "0" : "",
+			  dmt->major > 0 ? ") " : "");
 
 	/* FIXME Detect and warn if cookie set but should not be. */
 repeat_ioctl:
-	if (!(dmi = _do_dm_ioctl(dmt, command, _ioctl_buffer_double_factor))) {
+	if (!(dmi = _do_dm_ioctl(dmt, command, _ioctl_buffer_double_factor,
+				 ioctl_retry, &retryable))) {
+		/*
+		 * Async udev rules that scan devices commonly cause transient
+		 * failures.  Normally you'd expect the user to have made sure
+		 * nothing was using the device before issuing REMOVE, so it's
+		 * worth retrying in case the failure is indeed transient.
+		 */
+		if (retryable && dmt->type == DM_DEVICE_REMOVE &&
+		    dmt->retry_remove && ++ioctl_retry <= DM_IOCTL_RETRIES) {
+			usleep(DM_RETRY_USLEEP_DELAY);
+			goto repeat_ioctl;
+		}
+
 		_udev_complete(dmt);
 		return 0;
 	}
@@ -2059,46 +1875,56 @@ repeat_ioctl:
 		}
 	}
 
+	/*
+	 * Are we expecting a udev operation to occur that we need to check for?
+	 */
 	check_udev = dmt->cookie_set &&
 		     !(dmt->event_nr >> DM_UDEV_FLAGS_SHIFT &
 		       DM_UDEV_DISABLE_DM_RULES_FLAG);
 
-	udev_only = dmt->cookie_set ? (dmt->event_nr >> DM_UDEV_FLAGS_SHIFT &
-					DM_UDEV_DISABLE_LIBRARY_FALLBACK) : 0;
+	rely_on_udev = dmt->cookie_set ? (dmt->event_nr >> DM_UDEV_FLAGS_SHIFT &
+					  DM_UDEV_DISABLE_LIBRARY_FALLBACK) : 0;
 
 	switch (dmt->type) {
 	case DM_DEVICE_CREATE:
-		if (dmt->dev_name && *dmt->dev_name && !udev_only)
-			add_dev_node(dmt->dev_name, MAJOR(dmi->dev),
+		if ((dmt->add_node == DM_ADD_NODE_ON_CREATE) &&
+		    dev_name && *dev_name && !rely_on_udev)
+			add_dev_node(dev_name, MAJOR(dmi->dev),
 				     MINOR(dmi->dev), dmt->uid, dmt->gid,
-				     dmt->mode, check_udev);
+				     dmt->mode, check_udev, rely_on_udev);
 		break;
 	case DM_DEVICE_REMOVE:
 		/* FIXME Kernel needs to fill in dmi->name */
-		if (dmt->dev_name && !udev_only)
-			rm_dev_node(dmt->dev_name, check_udev);
+		if (dev_name && !rely_on_udev)
+			rm_dev_node(dev_name, check_udev, rely_on_udev);
 		break;
 
 	case DM_DEVICE_RENAME:
 		/* FIXME Kernel needs to fill in dmi->name */
-		if (!dmt->new_uuid && dmt->dev_name && !udev_only)
-			rename_dev_node(dmt->dev_name, dmt->newname,
-					check_udev);
+		if (!dmt->new_uuid && dev_name)
+			rename_dev_node(dev_name, dmt->newname,
+					check_udev, rely_on_udev);
 		break;
 
 	case DM_DEVICE_RESUME:
+		if ((dmt->add_node == DM_ADD_NODE_ON_RESUME) &&
+		    dev_name && *dev_name)
+			add_dev_node(dev_name, MAJOR(dmi->dev),
+				     MINOR(dmi->dev), dmt->uid, dmt->gid,
+				     dmt->mode, check_udev, rely_on_udev);
 		/* FIXME Kernel needs to fill in dmi->name */
-		set_dev_node_read_ahead(dmt->dev_name, dmt->read_ahead,
-					dmt->read_ahead_flags);
+		set_dev_node_read_ahead(dev_name,
+					MAJOR(dmi->dev), MINOR(dmi->dev),
+					dmt->read_ahead, dmt->read_ahead_flags);
 		break;
 	
 	case DM_DEVICE_MKNODES:
 		if (dmi->flags & DM_EXISTS_FLAG)
 			add_dev_node(dmi->name, MAJOR(dmi->dev),
 				     MINOR(dmi->dev), dmt->uid,
-				     dmt->gid, dmt->mode, 0);
-		else if (dmt->dev_name)
-			rm_dev_node(dmt->dev_name, 0);
+				     dmt->gid, dmt->mode, 0, rely_on_udev);
+		else if (dev_name)
+			rm_dev_node(dev_name, 0, rely_on_udev);
 		break;
 
 	case DM_DEVICE_STATUS:
@@ -2129,6 +1955,15 @@ void dm_pools_check_leaks(void);
 
 void dm_lib_exit(void)
 {
+	int suspended_counter;
+	static unsigned _exited = 0;
+
+	if (_exited++)
+		return;
+
+	if ((suspended_counter = dm_get_suspended_counter()))
+		log_error("libdevmapper exiting with %d device(s) still suspended.", suspended_counter);
+
 	dm_lib_release();
 	selinux_release();
 	if (_dm_bitset)

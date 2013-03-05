@@ -28,7 +28,7 @@ static char *_expand_filename(const char *template, const char *vg_name,
 		return NULL;
 	}
 
-	if (snprintf(filename, PATH_MAX, template, vg_name) < 0) {
+	if (dm_snprintf(filename, PATH_MAX, template, vg_name) < 0) {
 		log_error("Error processing filename template %s",
 			   template);
 		dm_free(filename);	
@@ -81,7 +81,7 @@ static int vg_backup_single(struct cmd_context *cmd, const char *vg_name,
 		}
 	}
 
-	log_print("Volume group \"%s\" successfully backed up.", vg_name);
+	log_print_unless_silent("Volume group \"%s\" successfully backed up.", vg_name);
 	return ECMD_PROCESSED;
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright (C) 2007-2010 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2007-2012 Red Hat, Inc. All rights reserved.
 #
 # This file is part of LVM2.
 #
@@ -31,6 +31,7 @@
 
 TOOL=fsadm
 
+_SAVEPATH=$PATH
 PATH=/sbin:/usr/sbin:/bin:/usr/sbin:$PATH
 
 # utilities
@@ -61,17 +62,19 @@ YES=${_FSADM_YES}
 DRY=0
 VERB=
 FORCE=
-EXTOFF=0
+EXTOFF=${_FSADM_EXTOFF:-0}
 DO_LVRESIZE=0
 FSTYPE=unknown
 VOLUME=unknown
 TEMPDIR="${TMPDIR:-/tmp}/${TOOL}_${RANDOM}$$/m"
+DM_DEV_DIR="${DM_DEV_DIR:-/dev}"
 BLOCKSIZE=
 BLOCKCOUNT=
 MOUNTPOINT=
 MOUNTED=
 REMOUNT=
 PROCMOUNTS="/proc/mounts"
+NULL="$DM_DEV_DIR/null"
 
 IFS_OLD=$IFS
 # without bash $'\n'
@@ -118,7 +121,7 @@ dry() {
 		return 0
 	fi
 	verbose "Executing $@"
-	$@
+	"$@"
 }
 
 cleanup() {
@@ -127,7 +130,7 @@ cleanup() {
 	test "$MOUNTPOINT" = "$TEMPDIR" && MOUNTPOINT="" temp_umount
 	if [ -n "$REMOUNT" ]; then
 		verbose "Remounting unmounted filesystem back"
-		dry $MOUNT "$VOLUME" "$MOUNTED"
+		dry "$MOUNT" "$VOLUME" "$MOUNTED"
 	fi
 	IFS=$IFS_OLD
 	trap 2
@@ -138,11 +141,13 @@ cleanup() {
 		# start LVRESIZE with the filesystem modification flag
 		# and allow recursive call of fsadm
 		_FSADM_YES=$YES
-		export _FSADM_YES
+		_FSADM_EXTOFF=$EXTOFF
+		export _FSADM_YES _FSADM_EXTOFF
 		unset FSADM_RUNNING
-		dry exec $LVM lvresize $VERB $FORCE -r -L${NEWSIZE}b $VOLUME_ORIG
+		test -n "$LVM_BINARY" && PATH=$_SAVEPATH
+		dry exec "$LVM" lvresize $VERB $FORCE -r -L${NEWSIZE}b "$VOLUME_ORIG"
 	fi
-        
+
 	# error exit status for break
 	exit ${1:-1}
 }
@@ -174,17 +179,18 @@ decode_size() {
 # dereference device name if it is symbolic link
 detect_fs() {
 	VOLUME_ORIG=$1
-	VOLUME=${1#/dev/}
-	VOLUME=$($READLINK $READLINK_E "/dev/$VOLUME") || error "Cannot get readlink $1"
+	VOLUME=${1/#"${DM_DEV_DIR}/"/}
+	VOLUME=$("$READLINK" $READLINK_E "$DM_DEV_DIR/$VOLUME") || error "Cannot get readlink \"$1\""
 	RVOLUME=$VOLUME
 	case "$RVOLUME" in
+          # hardcoded /dev  since udev does not create these entries elsewhere
 	  /dev/dm-[0-9]*)
-		read </sys/block/${RVOLUME#/dev/}/dm/name SYSVOLUME 2>&1 && VOLUME="/dev/mapper/$SYSVOLUME"
+		read </sys/block/${RVOLUME#/dev/}/dm/name SYSVOLUME 2>&1 && VOLUME="$DM_DEV_DIR/mapper/$SYSVOLUME"
 		;;
 	esac
-	# use /dev/null as cache file to be sure about the result
+	# use null device as cache file to be sure about the result
 	# not using option '-o value' to be compatible with older version of blkid
-	FSTYPE=$($BLKID -c /dev/null -s TYPE "$VOLUME") || error "Cannot get FSTYPE of \"$VOLUME\""
+	FSTYPE=$("$BLKID" -c "$NULL" -s TYPE "$VOLUME") || error "Cannot get FSTYPE of \"$VOLUME\""
 	FSTYPE=${FSTYPE##*TYPE=\"} # cut quotation marks
 	FSTYPE=${FSTYPE%%\"*}
 	verbose "\"$FSTYPE\" filesystem found on \"$VOLUME\""
@@ -193,12 +199,12 @@ detect_fs() {
 # check if the given device is already mounted and where
 # FIXME: resolve swap usage and device stacking
 detect_mounted()  {
-	test -e $PROCMOUNTS || error "Cannot detect mounted device $VOLUME"
+	test -e "$PROCMOUNTS" || error "Cannot detect mounted device \"$VOLUME\""
 
-	MOUNTED=$($GREP ^"$VOLUME" $PROCMOUNTS)
+	MOUNTED=$("$GREP" "^$VOLUME[ \t]" "$PROCMOUNTS")
 
 	# for empty string try again with real volume name
-	test -z "$MOUNTED" && MOUNTED=$($GREP ^"$RVOLUME" $PROCMOUNTS)
+	test -z "$MOUNTED" && MOUNTED=$("$GREP" "^$RVOLUME[ \t]" "$PROCMOUNTS")
 
 	# cut device name prefix and trim everything past mountpoint
 	# echo translates \040 to spaces
@@ -207,8 +213,8 @@ detect_mounted()  {
 
 	# for systems with different device names - check also mount output
 	if test -z "$MOUNTED" ; then
-		MOUNTED=$(LANG=C $MOUNT | $GREP ^"$VOLUME")
-		test -z "$MOUNTED" && MOUNTED=$(LANG=C $MOUNT | $GREP ^"$RVOLUME")
+		MOUNTED=$(LANG=C "$MOUNT" | "$GREP" "^$VOLUME[ \t]")
+		test -z "$MOUNTED" && MOUNTED=$(LANG=C "$MOUNT" | "$GREP" "^$RVOLUME[ \t]")
 		MOUNTED=${MOUNTED##* on }
 		MOUNTED=${MOUNTED% type *} # allow type in the mount name
 	fi
@@ -219,12 +225,12 @@ detect_mounted()  {
 # get the full size of device in bytes
 detect_device_size() {
 	# check if blockdev supports getsize64
-	$BLOCKDEV 2>&1 | $GREP getsize64 >/dev/null
+	"$BLOCKDEV" 2>&1 | "$GREP" getsize64 >"$NULL"
 	if test $? -eq 0; then
-		DEVSIZE=$($BLOCKDEV --getsize64 "$VOLUME") || error "Cannot read size of device \"$VOLUME\""
+		DEVSIZE=$("$BLOCKDEV" --getsize64 "$VOLUME") || error "Cannot read size of device \"$VOLUME\""
 	else
-		DEVSIZE=$($BLOCKDEV --getsize "$VOLUME") || error "Cannot read size of device \"$VOLUME\""
-		SSSIZE=$($BLOCKDEV --getss "$VOLUME") || error "Cannot block size read device \"$VOLUME\""
+		DEVSIZE=$("$BLOCKDEV" --getsize "$VOLUME") || error "Cannot read size of device \"$VOLUME\""
+		SSSIZE=$("$BLOCKDEV" --getss "$VOLUME") || error "Cannot block size read device \"$VOLUME\""
 		DEVSIZE=$(($DEVSIZE * $SSSIZE))
 	fi
 }
@@ -237,14 +243,14 @@ round_up_block_size() {
 }
 
 temp_mount() {
-	dry $MKDIR -p -m 0000 "$TEMPDIR" || error "Failed to create $TEMPDIR"
-	dry $MOUNT "$VOLUME" "$TEMPDIR" || error "Failed to mount $TEMPDIR"
+	dry "$MKDIR" -p -m 0000 "$TEMPDIR" || error "Failed to create $TEMPDIR"
+	dry "$MOUNT" "$VOLUME" "$TEMPDIR" || error "Failed to mount $TEMPDIR"
 }
 
 temp_umount() {
-	dry $UMOUNT "$TEMPDIR" || error "Failed to umount $TEMPDIR"
-	dry $RMDIR "${TEMPDIR}" || error "Failed to remove $TEMPDIR"
-	dry $RMDIR "${TEMPDIR%%m}" || error "Failed to remove ${TEMPDIR%%m}"
+	dry "$UMOUNT" "$TEMPDIR" || error "Failed to umount \"$TEMPDIR\""
+	dry "$RMDIR" "${TEMPDIR}" || error "Failed to remove \"$TEMPDIR\""
+	dry "$RMDIR" "${TEMPDIR%%m}" || error "Failed to remove \"${TEMPDIR%%m}\""
 }
 
 yes_no() {
@@ -263,7 +269,7 @@ yes_no() {
 }
 
 try_umount() {
-	yes_no "Do you want to unmount \"$MOUNTED\"" && dry $UMOUNT "$MOUNTED" && return 0
+	yes_no "Do you want to unmount \"$MOUNTED\"" && dry "$UMOUNT" "$MOUNTED" && return 0
 	error "Cannot proceed with mounted filesystem \"$MOUNTED\""
 }
 
@@ -277,13 +283,13 @@ validate_parsing() {
 ####################################
 resize_ext() {
 	verbose "Parsing $TUNE_EXT -l \"$VOLUME\""
-	for i in $(LANG=C $TUNE_EXT -l "$VOLUME"); do
+	for i in $(LANG=C "$TUNE_EXT" -l "$VOLUME"); do
 		case "$i" in
 		  "Block size"*) BLOCKSIZE=${i##*  } ;;
 		  "Block count"*) BLOCKCOUNT=${i##*  } ;;
 		esac
 	done
-	validate_parsing $TUNE_EXT
+	validate_parsing "$TUNE_EXT"
 	decode_size $1 $BLOCKSIZE
 	FSFORCE=$FORCE
 
@@ -293,14 +299,14 @@ resize_ext() {
 		if test -n "$MOUNTED" ; then
 			# Forced fsck -f for umounted extX filesystem.
 			case "$-" in
-			  *i*) dry $FSCK $YES -f "$VOLUME" ;;
-			  *) dry $FSCK -f -p "$VOLUME" ;;
+			  *i*) dry "$FSCK" $YES -f "$VOLUME" ;;
+			  *) dry "$FSCK" -f -p "$VOLUME" ;;
 			esac
 		fi
 	fi
 
 	verbose "Resizing filesystem on device \"$VOLUME\" to $NEWSIZE bytes ($BLOCKCOUNT -> $NEWBLOCKCOUNT blocks of $BLOCKSIZE bytes)"
-	dry $RESIZE_EXT $FSFORCE "$VOLUME" $NEWBLOCKCOUNT
+	dry "$RESIZE_EXT" $FSFORCE "$VOLUME" $NEWBLOCKCOUNT
 }
 
 #############################
@@ -312,19 +318,19 @@ resize_reiser() {
 	detect_mounted && verbose "ReiserFS resizes only unmounted filesystem" && try_umount
 	REMOUNT=$MOUNTED
 	verbose "Parsing $TUNE_REISER \"$VOLUME\""
-	for i in $(LANG=C $TUNE_REISER "$VOLUME"); do
+	for i in $(LANG=C "$TUNE_REISER" "$VOLUME"); do
 		case "$i" in
 		  "Blocksize"*) BLOCKSIZE=${i##*: } ;;
 		  "Count of blocks"*) BLOCKCOUNT=${i##*: } ;;
 		esac
 	done
-	validate_parsing $TUNE_REISER
+	validate_parsing "$TUNE_REISER"
 	decode_size $1 $BLOCKSIZE
 	verbose "Resizing \"$VOLUME\" $BLOCKCOUNT -> $NEWBLOCKCOUNT blocks ($NEWSIZE bytes, bs: $NEWBLOCKCOUNT)"
 	if [ -n "$YES" ]; then
-		echo y | dry $RESIZE_REISER -s $NEWSIZE "$VOLUME"
+		echo y | dry "$RESIZE_REISER" -s $NEWSIZE "$VOLUME"
 	else
-		dry $RESIZE_REISER -s $NEWSIZE "$VOLUME"
+		dry "$RESIZE_REISER" -s $NEWSIZE "$VOLUME"
 	fi
 }
 
@@ -341,18 +347,18 @@ resize_xfs() {
 		temp_mount || error "Cannot mount Xfs filesystem"
 	fi
 	verbose "Parsing $TUNE_XFS \"$MOUNTPOINT\""
-	for i in $(LANG=C $TUNE_XFS "$MOUNTPOINT"); do
+	for i in $(LANG=C "$TUNE_XFS" "$MOUNTPOINT"); do
 		case "$i" in
 		  "data"*) BLOCKSIZE=${i##*bsize=} ; BLOCKCOUNT=${i##*blocks=} ;;
 		esac
 	done
 	BLOCKSIZE=${BLOCKSIZE%%[^0-9]*}
 	BLOCKCOUNT=${BLOCKCOUNT%%[^0-9]*}
-	validate_parsing $TUNE_XFS
+	validate_parsing "$TUNE_XFS"
 	decode_size $1 $BLOCKSIZE
 	if [ $NEWBLOCKCOUNT -gt $BLOCKCOUNT ]; then
 		verbose "Resizing Xfs mounted on \"$MOUNTPOINT\" to fill device \"$VOLUME\""
-		dry $RESIZE_XFS $MOUNTPOINT
+		dry "$RESIZE_XFS" $MOUNTPOINT
 	elif [ $NEWBLOCKCOUNT -eq $BLOCKCOUNT ]; then
 		verbose "Xfs filesystem already has the right size"
 	else
@@ -387,7 +393,7 @@ resize() {
 #  only one supported
 ####################################
 diff_dates() {
-         echo $(( $($DATE -u -d"$1" +%s 2>/dev/null) - $($DATE -u -d"$2" +%s 2>/dev/null) ))
+         echo $(( $("$DATE" -u -d"$1" +%s 2>"$NULL") - $("$DATE" -u -d"$2" +%s 2>"$NULL") ))
 }
 
 ###################
@@ -404,7 +410,7 @@ check() {
 	  "ext2"|"ext3"|"ext4")
 		IFS_CHECK=$IFS
 		IFS=$NL
-		for i in $(LANG=C $TUNE_EXT -l "$VOLUME"); do
+		for i in $(LANG=C "$TUNE_EXT" -l "$VOLUME"); do
 			case "$i" in
 			  "Last mount"*) LASTMOUNT=${i##*: } ;;
 			  "Last checked"*) LASTCHECKED=${i##*: } ;;
@@ -424,11 +430,11 @@ check() {
 	esac
 
 	case "$FSTYPE" in
-	  "xfs") dry $XFS_CHECK "$VOLUME" ;;
+	  "xfs") dry "$XFS_CHECK" "$VOLUME" ;;
 	  *)    # check if executed from interactive shell environment
 		case "$-" in
-		  *i*) dry $FSCK $YES $FORCE "$VOLUME" ;;
-		  *) dry $FSCK $FORCE -p "$VOLUME" ;;
+		  *i*) dry "$FSCK" $YES $FORCE "$VOLUME" ;;
+		  *) dry "$FSCK" $FORCE -p "$VOLUME" ;;
 		esac
 	esac
 }
@@ -446,15 +452,15 @@ test -n "$FSADM_RUNNING" && exit 0
 test -n "$TUNE_EXT" -a -n "$RESIZE_EXT" -a -n "$TUNE_REISER" -a -n "$RESIZE_REISER" \
   -a -n "$TUNE_XFS" -a -n "$RESIZE_XFS" -a -n "$MOUNT" -a -n "$UMOUNT" -a -n "$MKDIR" \
   -a -n "$RMDIR" -a -n "$BLOCKDEV" -a -n "$BLKID" -a -n "$GREP" -a -n "$READLINK" \
-  -a -n "$DATE" -a -n "$FSCK" -a -n "$XFS_CHECK" -a -n "LVM" \
+  -a -n "$DATE" -a -n "$FSCK" -a -n "$XFS_CHECK" -a -n "$LVM" \
   || error "Required command definitions in the script are missing!"
 
-$LVM version >/dev/null 2>&1 || error "Could not run lvm binary '$LVM'"
-$($READLINK -e / >/dev/null 2>&1) || READLINK_E="-f"
+"$LVM" version >"$NULL" 2>&1 || error "Could not run lvm binary \"$LVM\""
+$("$READLINK" -e / >"$NULL" 2>&1) || READLINK_E="-f"
 TEST64BIT=$(( 1000 * 1000000000000 ))
-test $TEST64BIT -eq 1000000000000000 || error "Shell does not handle 64bit arithmetic"
-$(echo Y | $GREP Y >/dev/null) || error "Grep does not work properly"
-test $($DATE -u -d"Jan 01 00:00:01 1970" +%s) -eq 1 || error "Date translation does not work"
+test "$TEST64BIT" -eq 1000000000000000 || error "Shell does not handle 64bit arithmetic"
+$(echo Y | "$GREP" Y >"$NULL") || error "Grep does not work properly"
+test $("$DATE" -u -d"Jan 01 00:00:01 1970" +%s) -eq 1 || error "Date translation does not work"
 
 
 if [ "$#" -eq 0 ] ; then
@@ -478,6 +484,9 @@ do
 	esac
 	shift
 done
+
+test "$YES" = "-y" || YES=
+test "$EXTOFF" -eq 1 || EXTOFF=0
 
 if [ -n "$CHECK" ]; then
 	check "$CHECK"

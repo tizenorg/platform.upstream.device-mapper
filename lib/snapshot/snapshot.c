@@ -28,15 +28,16 @@ static const char *_snap_name(const struct lv_segment *seg)
 	return seg->segtype->name;
 }
 
-static const char *_snap_target_name(const struct lv_segment *seg)
+static const char *_snap_target_name(const struct lv_segment *seg,
+				     const struct lv_activate_opts *laopts)
 {
-	if (seg->status & MERGING)
+	if (!laopts->no_merging && (seg->status & MERGING))
 		return "snapshot-merge";
 
 	return _snap_name(seg);
 }
 
-static int _snap_text_import(struct lv_segment *seg, const struct config_node *sn,
+static int _snap_text_import(struct lv_segment *seg, const struct dm_config_node *sn,
 			struct dm_hash_table *pv_hash __attribute__((unused)))
 {
 	uint32_t chunk_size;
@@ -44,28 +45,28 @@ static int _snap_text_import(struct lv_segment *seg, const struct config_node *s
 	struct logical_volume *org, *cow;
 	int old_suppress, merge = 0;
 
-	if (!get_config_uint32(sn, "chunk_size", &chunk_size)) {
+	if (!dm_config_get_uint32(sn, "chunk_size", &chunk_size)) {
 		log_error("Couldn't read chunk size for snapshot.");
 		return 0;
 	}
 
 	old_suppress = log_suppress(1);
 
-	if ((cow_name = find_config_str(sn, "merging_store", NULL))) {
-		if (find_config_str(sn, "cow_store", NULL)) {
+	if ((cow_name = dm_config_find_str(sn, "merging_store", NULL))) {
+		if (dm_config_find_str(sn, "cow_store", NULL)) {
 			log_suppress(old_suppress);
 			log_error("Both snapshot cow and merging storage were specified.");
 			return 0;
 		}
 		merge = 1;
 	}
-	else if (!(cow_name = find_config_str(sn, "cow_store", NULL))) {
+	else if (!(cow_name = dm_config_find_str(sn, "cow_store", NULL))) {
 		log_suppress(old_suppress);
 		log_error("Snapshot cow storage not specified.");
 		return 0;
 	}
 
-	if (!(org_name = find_config_str(sn, "origin", NULL))) {
+	if (!(org_name = dm_config_find_str(sn, "origin", NULL))) {
 		log_suppress(old_suppress);
 		log_error("Snapshot origin not specified.");
 		return 0;
@@ -135,9 +136,11 @@ static int _snap_target_percent(void **target_state __attribute__((unused)),
 			*percent = PERCENT_100;
 		else
 			*percent = make_percent(*total_numerator, *total_denominator);
-	} else if (!strcmp(params, "Invalid") ||
-		   !strcmp(params, "Merge failed"))
+	}
+	else if (!strcmp(params, "Invalid"))
 		*percent = PERCENT_INVALID;
+	else if (!strcmp(params, "Merge failed"))
+		*percent = PERCENT_MERGE_FAILED;
 	else
 		return 0;
 
@@ -232,11 +235,11 @@ static struct segtype_handler _snapshot_ops = {
 #ifdef DEVMAPPER_SUPPORT
 	.target_percent = _snap_target_percent,
 	.target_present = _snap_target_present,
-#ifdef DMEVENTD
+#  ifdef DMEVENTD
 	.target_monitored = _target_registered,
 	.target_monitor_events = _target_register_events,
 	.target_unmonitor_events = _target_unregister_events,
-#endif
+#  endif	/* DMEVENTD */
 #endif
 	.modules_needed = _snap_modules_needed,
 	.destroy = _snap_destroy,
@@ -249,7 +252,7 @@ struct segment_type *init_segtype(struct cmd_context *cmd);
 struct segment_type *init_segtype(struct cmd_context *cmd)
 #endif
 {
-	struct segment_type *segtype = dm_malloc(sizeof(*segtype));
+	struct segment_type *segtype = dm_zalloc(sizeof(*segtype));
 
 	if (!segtype)
 		return_NULL;
@@ -260,9 +263,11 @@ struct segment_type *init_segtype(struct cmd_context *cmd)
 	segtype->private = NULL;
 	segtype->flags = SEG_SNAPSHOT;
 
-#ifdef DMEVENTD
+#ifdef DEVMAPPER_SUPPORT
+#  ifdef DMEVENTD
 	if (_get_snapshot_dso_path(cmd))
 		segtype->flags |= SEG_MONITORED;
+#  endif	/* DMEVENTD */
 #endif
 	log_very_verbose("Initialised segtype: %s", segtype->name);
 

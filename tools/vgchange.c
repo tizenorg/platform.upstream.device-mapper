@@ -24,21 +24,19 @@ static int _monitor_lvs_in_vg(struct cmd_context *cmd,
 	struct lv_list *lvl;
 	struct logical_volume *lv;
 	struct lvinfo info;
-	int lv_active;
 	int r = 1;
 
 	dm_list_iterate_items(lvl, &vg->lvs) {
 		lv = lvl->lv;
 
-		if (!lv_info(cmd, lv, 0, &info, 0, 0))
-			lv_active = 0;
-		else
-			lv_active = info.exists;
-
+		if (!lv_info(cmd, lv, lv_is_thin_pool(lv) ? 1 : 0,
+			     &info, 0, 0) ||
+		    !info.exists)
+			continue;
 		/*
 		 * FIXME: Need to consider all cases... PVMOVE, etc
 		 */
-		if ((lv->status & PVMOVE) || !lv_active)
+		if (lv->status & PVMOVE)
 			continue;
 
 		if (!monitor_dev_for_events(cmd, lv, 0, reg)) {
@@ -83,18 +81,26 @@ static int _poll_lvs_in_vg(struct cmd_context *cmd,
 	return count;
 }
 
-static int _activate_lvs_in_vg(struct cmd_context *cmd,
-			       struct volume_group *vg, int activate)
+static int _activate_lvs_in_vg(struct cmd_context *cmd, struct volume_group *vg,
+			       activation_change_t activate)
 {
 	struct lv_list *lvl;
 	struct logical_volume *lv;
 	int count = 0, expected_count = 0;
 
+	sigint_allow();
 	dm_list_iterate_items(lvl, &vg->lvs) {
+		if (sigint_caught())
+			return_0;
+
 		lv = lvl->lv;
 
 		if (!lv_is_visible(lv))
 			continue;
+
+		/* If LV is sparse, activate origin instead */
+		if (lv_is_cow(lv) && lv_is_virtual_origin(origin_from_cow(lv)))
+			lv = origin_from_cow(lv);
 
 		/* Only request activation of snapshot origin devices */
 		if ((lv->status & SNAPSHOT) || lv_is_cow(lv))
@@ -115,6 +121,19 @@ static int _activate_lvs_in_vg(struct cmd_context *cmd,
 		    ((lv->status & PVMOVE) ))
 			continue;
 
+		/*
+		 * If the LV is active exclusive remotely,
+		 * then ignore it here
+		 */
+		if (lv_is_active_exclusive_remotely(lv)) {
+			log_verbose("%s/%s is exclusively active on"
+				    " a remote node", vg->name, lv->name);
+			continue;
+		}
+
+		if (activate == CHANGE_AAY && !lv_passes_auto_activation_filter(cmd, lv))
+			continue;
+
 		expected_count++;
 
 		if (activate == CHANGE_AN) {
@@ -127,12 +146,15 @@ static int _activate_lvs_in_vg(struct cmd_context *cmd,
 				stack;
 				continue;
 			}
-		} else if (lv_is_origin(lv) || (activate == CHANGE_AE)) {
+		} else if ((activate == CHANGE_AE) ||
+			   lv_is_origin(lv) ||
+			   lv_is_thin_type(lv)) {
+			/* FIXME: duplicated test code with lvchange */
 			if (!activate_lv_excl(cmd, lv)) {
 				stack;
 				continue;
 			}
-		} else if (activate == CHANGE_ALY) {
+		} else if (activate == CHANGE_AAY || activate == CHANGE_ALY) {
 			if (!activate_lv_local(cmd, lv)) {
 				stack;
 				continue;
@@ -149,6 +171,8 @@ static int _activate_lvs_in_vg(struct cmd_context *cmd,
 
 		count++;
 	}
+
+	sigint_restore();
 
 	if (expected_count)
 		log_verbose("%s %d logical volumes in volume group %s",
@@ -167,9 +191,9 @@ static int _vgchange_monitoring(struct cmd_context *cmd, struct volume_group *vg
 	    dmeventd_monitor_mode() != DMEVENTD_MONITOR_IGNORE) {
 		if (!_monitor_lvs_in_vg(cmd, vg, dmeventd_monitor_mode(), &monitored))
 			r = 0;
-		log_print("%d logical volume(s) in volume group "
-			    "\"%s\" %smonitored",
-			    monitored, vg->name, (dmeventd_monitor_mode()) ? "" : "un");
+		log_print_unless_silent("%d logical volume(s) in volume group "
+					"\"%s\" %smonitored",
+					monitored, vg->name, (dmeventd_monitor_mode()) ? "" : "un");
 	}
 
 	return r;
@@ -182,43 +206,40 @@ static int _vgchange_background_polling(struct cmd_context *cmd, struct volume_g
 	if (lvs_in_vg_activated(vg) && background_polling()) {
 	        polled = _poll_lvs_in_vg(cmd, vg);
 		if (polled)
-			log_print("Background polling started for %d logical volume(s) "
-				  "in volume group \"%s\"",
-				  polled, vg->name);
+			log_print_unless_silent("Background polling started for %d logical volume(s) "
+						"in volume group \"%s\"",
+						polled, vg->name);
 	}
 
 	return 1;
 }
 
-static int _vgchange_available(struct cmd_context *cmd, struct volume_group *vg)
+int vgchange_activate(struct cmd_context *cmd, struct volume_group *vg,
+		      activation_change_t activate)
 {
-	int lv_open, active, monitored = 0;
-	int available, r = 1;
-	int activate = 1;
+	int lv_open, active, monitored = 0, r = 1, do_activate = 1;
+
+	if ((activate == CHANGE_AN) || (activate == CHANGE_ALN))
+		do_activate = 0;
 
 	/*
 	 * Safe, since we never write out new metadata here. Required for
 	 * partial activation to work.
 	 */
-	cmd->handles_missing_pvs = 1;
-
-	available = arg_uint_value(cmd, available_ARG, 0);
-
-	if ((available == CHANGE_AN) || (available == CHANGE_ALN))
-		activate = 0;
+        cmd->handles_missing_pvs = 1;
 
 	/* FIXME: Force argument to deactivate them? */
-	if (!activate && (lv_open = lvs_in_vg_opened(vg))) {
+	if (!do_activate && (lv_open = lvs_in_vg_opened(vg))) {
 		log_error("Can't deactivate volume group \"%s\" with %d open "
 			  "logical volume(s)", vg->name, lv_open);
 		return 0;
 	}
 
 	/* FIXME Move into library where clvmd can use it */
-	if (activate)
+	if (do_activate)
 		check_current_backup(vg);
 
-	if (activate && (active = lvs_in_vg_activated(vg))) {
+	if (do_activate && (active = lvs_in_vg_activated(vg))) {
 		log_verbose("%d logical volume(s) in volume group \"%s\" "
 			    "already active", active, vg->name);
 		if (dmeventd_monitor_mode() != DMEVENTD_MONITOR_IGNORE) {
@@ -231,13 +252,13 @@ static int _vgchange_available(struct cmd_context *cmd, struct volume_group *vg)
 		}
 	}
 
-	if (!_activate_lvs_in_vg(cmd, vg, available))
+	if (!_activate_lvs_in_vg(cmd, vg, activate))
 		r = 0;
 
 	/* Print message only if there was not found a missing VG */
 	if (!vg->cmd_missing_vgs)
-		log_print("%d logical volume(s) in volume group \"%s\" now active",
-			  lvs_in_vg_activated(vg), vg->name);
+		log_print_unless_silent("%d logical volume(s) in volume group \"%s\" now active",
+					lvs_in_vg_activated(vg), vg->name);
 	return r;
 }
 
@@ -257,7 +278,7 @@ static int _vgchange_alloc(struct cmd_context *cmd, struct volume_group *vg)
 {
 	alloc_policy_t alloc;
 
-	alloc = arg_uint_value(cmd, alloc_ARG, ALLOC_NORMAL);
+	alloc = (alloc_policy_t) arg_uint_value(cmd, alloc_ARG, ALLOC_NORMAL);
 
 	/* FIXME: make consistent with vg_set_alloc_policy() */
 	if (alloc == vg->alloc) {
@@ -346,6 +367,12 @@ static int _vgchange_pesize(struct cmd_context *cmd, struct volume_group *vg)
 {
 	uint32_t extent_size;
 
+	if (arg_uint64_value(cmd, physicalextentsize_ARG, 0) > MAX_EXTENT_SIZE) {
+		log_error("Physical extent size cannot be larger than %s",
+				  display_size(cmd, (uint64_t) MAX_EXTENT_SIZE));
+		return 1;
+	}
+
 	extent_size = arg_uint_value(cmd, physicalextentsize_ARG, 0);
 	/* FIXME: remove check - redundant with vg_change_pesize */
 	if (extent_size == vg->extent_size) {
@@ -360,37 +387,14 @@ static int _vgchange_pesize(struct cmd_context *cmd, struct volume_group *vg)
 	return 1;
 }
 
-static int _vgchange_tag(struct cmd_context *cmd, struct volume_group *vg,
-			 int arg)
-{
-	const char *tag;
-	struct arg_value_group_list *current_group;
-
-	dm_list_iterate_items(current_group, &cmd->arg_value_groups) {
-		if (!grouped_arg_is_set(current_group->arg_values, arg))
-			continue;
-
-		if (!(tag = grouped_arg_str_value(current_group->arg_values, arg, NULL))) {
-			log_error("Failed to get tag");
-			return 0;
-		}
-
-		if (!vg_change_tag(vg, tag, arg == addtag_ARG))
-			return_0;
-
-	}
-
-	return 1;
-}
-
 static int _vgchange_addtag(struct cmd_context *cmd, struct volume_group *vg)
 {
-	return _vgchange_tag(cmd, vg, addtag_ARG);
+	return change_tag(cmd, vg, NULL, NULL, addtag_ARG);
 }
 
 static int _vgchange_deltag(struct cmd_context *cmd, struct volume_group *vg)
 {
-	return _vgchange_tag(cmd, vg, deltag_ARG);
+	return change_tag(cmd, vg, NULL, NULL, deltag_ARG);
 }
 
 static int _vgchange_uuid(struct cmd_context *cmd __attribute__((unused)),
@@ -441,7 +445,6 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 			   struct volume_group *vg,
 			   void *handle __attribute__((unused)))
 {
-	int dmeventd_mode;
 	int archived = 0;
 	int i;
 
@@ -466,11 +469,6 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 		log_error("Volume group \"%s\" is exported", vg_name);
 		return ECMD_FAILED;
 	}
-
-	if (!get_activation_monitoring_mode(cmd, vg, &dmeventd_mode))
-		return ECMD_FAILED;
-
-	init_dmeventd_monitor(dmeventd_mode);
 
 	/*
 	 * FIXME: DEFAULT_BACKGROUND_POLLING should be "unspecified".
@@ -507,11 +505,12 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 
 		backup(vg);
 
-		log_print("Volume group \"%s\" successfully changed", vg->name);
+		log_print_unless_silent("Volume group \"%s\" successfully changed", vg->name);
 	}
 
-	if (arg_count(cmd, available_ARG)) {
-		if (!_vgchange_available(cmd, vg))
+	if (arg_count(cmd, activate_ARG)) {
+		if (!vgchange_activate(cmd, vg, (activation_change_t)
+				       arg_uint_value(cmd, activate_ARG, CHANGE_AY)))
 			return ECMD_FAILED;
 	}
 
@@ -521,7 +520,7 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 			return ECMD_FAILED;
 	}
 
-	if (!arg_count(cmd, available_ARG) &&
+	if (!arg_count(cmd, activate_ARG) &&
 	    !arg_count(cmd, refresh_ARG) &&
 	    arg_count(cmd, monitor_ARG)) {
 		/* -ay* will have already done monitoring changes */
@@ -530,7 +529,7 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 	}
 
 	if (!arg_count(cmd, refresh_ARG) &&
-	    arg_count(cmd, poll_ARG))
+	    background_polling())
 		if (!_vgchange_background_polling(cmd, vg))
 			return ECMD_FAILED;
 
@@ -540,20 +539,22 @@ static int vgchange_single(struct cmd_context *cmd, const char *vg_name,
 int vgchange(struct cmd_context *cmd, int argc, char **argv)
 {
 	/* Update commands that can be combined */
-	int update = 
+	int update_partial_safe =
+		arg_count(cmd, deltag_ARG) ||
+		arg_count(cmd, addtag_ARG);
+	int update_partial_unsafe =
 		arg_count(cmd, logicalvolume_ARG) ||
 		arg_count(cmd, maxphysicalvolumes_ARG) ||
 		arg_count(cmd, resizeable_ARG) ||
-		arg_count(cmd, deltag_ARG) ||
-		arg_count(cmd, addtag_ARG) ||
 		arg_count(cmd, uuid_ARG) ||
 		arg_count(cmd, physicalextentsize_ARG) ||
 		arg_count(cmd, clustered_ARG) ||
 		arg_count(cmd, alloc_ARG) ||
 		arg_count(cmd, vgmetadatacopies_ARG);
+	int update = update_partial_safe || update_partial_unsafe;
 
 	if (!update &&
-	    !arg_count(cmd, available_ARG) &&
+	    !arg_count(cmd, activate_ARG) &&
 	    !arg_count(cmd, monitor_ARG) &&
 	    !arg_count(cmd, poll_ARG) &&
 	    !arg_count(cmd, refresh_ARG)) {
@@ -564,7 +565,7 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 		return EINVALID_CMD_LINE;
 	}
 
-	if (arg_count(cmd, available_ARG) && arg_count(cmd, refresh_ARG)) {
+	if (arg_count(cmd, activate_ARG) && arg_count(cmd, refresh_ARG)) {
 		log_error("Only one of -a and --refresh permitted.");
 		return EINVALID_CMD_LINE;
 	}
@@ -575,9 +576,9 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 		return EINVALID_CMD_LINE;
 	}
 
-	if (arg_count(cmd, available_ARG) &&
+	if (arg_count(cmd, activate_ARG) &&
 	    (arg_count(cmd, monitor_ARG) || arg_count(cmd, poll_ARG))) {
-		int activate = arg_uint_value(cmd, available_ARG, 0);
+		int activate = arg_uint_value(cmd, activate_ARG, 0);
 		if (activate == CHANGE_AN || activate == CHANGE_ALN) {
 			log_error("Only -ay* allowed with --monitor or --poll.");
 			return EINVALID_CMD_LINE;
@@ -589,23 +590,33 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 		return EINVALID_CMD_LINE;
 	}
 
-	if (arg_count(cmd, available_ARG) == 1
+	if (arg_count(cmd, activate_ARG) == 1
 	    && arg_count(cmd, autobackup_ARG)) {
 		log_error("-A option not necessary with -a option");
 		return EINVALID_CMD_LINE;
 	}
 
 	if (arg_count(cmd, maxphysicalvolumes_ARG) &&
-	    arg_sign_value(cmd, maxphysicalvolumes_ARG, 0) == SIGN_MINUS) {
+	    arg_sign_value(cmd, maxphysicalvolumes_ARG, SIGN_NONE) == SIGN_MINUS) {
 		log_error("MaxPhysicalVolumes may not be negative");
 		return EINVALID_CMD_LINE;
 	}
 
 	if (arg_count(cmd, physicalextentsize_ARG) &&
-	    arg_sign_value(cmd, physicalextentsize_ARG, 0) == SIGN_MINUS) {
+	    arg_sign_value(cmd, physicalextentsize_ARG, SIGN_NONE) == SIGN_MINUS) {
 		log_error("Physical extent size may not be negative");
 		return EINVALID_CMD_LINE;
 	}
+
+	if (arg_count(cmd, sysinit_ARG) && lvmetad_active() &&
+	    arg_uint_value(cmd, activate_ARG, 0) == CHANGE_AAY) {
+		log_warn("lvmetad is active while using --sysinit -a ay, "
+			 "skipping manual activation");
+		return ECMD_PROCESSED;
+	}
+
+	if (!update || !update_partial_unsafe)
+		cmd->handles_missing_pvs = 1;
 
 	return process_each_vg(cmd, argc, argv, update ? READ_FOR_UPDATE : 0,
 			       NULL, &vgchange_single);

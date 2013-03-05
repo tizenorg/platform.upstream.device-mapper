@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2002-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2009 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -21,7 +21,6 @@
 #include "display.h"
 #include "activate.h"
 #include "segtype.h"
-#include "str_list.h"
 #include "lvmcache.h"
 
 #include <stddef.h> /* offsetof() */
@@ -44,7 +43,7 @@ static int _string_disp(struct dm_report *rh, struct dm_pool *mem __attribute__(
 			struct dm_report_field *field,
 			const void *data, void *private __attribute__((unused)))
 {
-	return dm_report_field_string(rh, field, (const char **) data);
+	return dm_report_field_string(rh, field, (const char * const *) data);
 }
 
 static int _dev_name_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
@@ -56,93 +55,30 @@ static int _dev_name_disp(struct dm_report *rh, struct dm_pool *mem __attribute_
 	return dm_report_field_string(rh, field, &name);
 }
 
-static int _format_pvsegs(struct dm_pool *mem, struct dm_report_field *field,
-			  const void *data, int range_format)
-{
-	const struct lv_segment *seg = (const struct lv_segment *) data;
-	unsigned int s;
-	const char *name = NULL;
-	uint32_t extent = 0;
-	char extent_str[32];
-
-	if (!dm_pool_begin_object(mem, 256)) {
-		log_error("dm_pool_begin_object failed");
-		return 0;
-	}
-
-	for (s = 0; s < seg->area_count; s++) {
-		switch (seg_type(seg, s)) {
-		case AREA_LV:
-			name = seg_lv(seg, s)->name;
-			extent = seg_le(seg, s);
-			break;
-		case AREA_PV:
-			name = dev_name(seg_dev(seg, s));
-			extent = seg_pe(seg, s);
-			break;
-		case AREA_UNASSIGNED:
-			name = "unassigned";
-			extent = 0;
-		}
-
-		if (!dm_pool_grow_object(mem, name, strlen(name))) {
-			log_error("dm_pool_grow_object failed");
-			return 0;
-		}
-
-		if (dm_snprintf(extent_str, sizeof(extent_str),
-				"%s%" PRIu32 "%s",
-				range_format ? ":" : "(", extent,
-				range_format ? "-"  : ")") < 0) {
-			log_error("Extent number dm_snprintf failed");
-			return 0;
-		}
-		if (!dm_pool_grow_object(mem, extent_str, strlen(extent_str))) {
-			log_error("dm_pool_grow_object failed");
-			return 0;
-		}
-
-		if (range_format) {
-			if (dm_snprintf(extent_str, sizeof(extent_str),
-					"%" PRIu32, extent + seg->area_len - 1) < 0) {
-				log_error("Extent number dm_snprintf failed");
-				return 0;
-			}
-			if (!dm_pool_grow_object(mem, extent_str, strlen(extent_str))) {
-				log_error("dm_pool_grow_object failed");
-				return 0;
-			}
-		}
-
-		if ((s != seg->area_count - 1) &&
-		    !dm_pool_grow_object(mem, range_format ? " " : ",", 1)) {
-			log_error("dm_pool_grow_object failed");
-			return 0;
-		}
-	}
-
-	if (!dm_pool_grow_object(mem, "\0", 1)) {
-		log_error("dm_pool_grow_object failed");
-		return 0;
-	}
-
-	dm_report_field_set_value(field, dm_pool_end_object(mem), NULL);
-
-	return 1;
-}
-
 static int _devices_disp(struct dm_report *rh __attribute__((unused)), struct dm_pool *mem,
 			 struct dm_report_field *field,
 			 const void *data, void *private __attribute__((unused)))
 {
-	return _format_pvsegs(mem, field, data, 0);
+	char *str;
+	if (!(str = lvseg_devices(mem, (const struct lv_segment *) data)))
+		return 0;
+
+	dm_report_field_set_value(field, str, NULL);
+
+	return 1;
 }
 
 static int _peranges_disp(struct dm_report *rh __attribute__((unused)), struct dm_pool *mem,
 			  struct dm_report_field *field,
 			  const void *data, void *private __attribute__((unused)))
 {
-	return _format_pvsegs(mem, field, data, 1);
+	char *str;
+	if (!(str = lvseg_seg_pe_ranges(mem, (const struct lv_segment *) data)))
+		return 0;
+
+	dm_report_field_set_value(field, str, NULL);
+
+	return 1;
 }
 
 static int _tags_disp(struct dm_report *rh __attribute__((unused)), struct dm_pool *mem,
@@ -278,9 +214,13 @@ static int _segtype_disp(struct dm_report *rh __attribute__((unused)),
 			 const void *data, void *private __attribute__((unused)))
 {
 	const struct lv_segment *seg = (const struct lv_segment *) data;
-
 	char *name;
-	name = lvseg_segtype_dup(seg);
+
+	if (!(name = lvseg_segtype_dup(mem, seg))) {
+		log_error("Failed to get segtype.");
+		return 0;
+	}
+
 	dm_report_field_set_value(field, name, NULL);
 	return 1;
 }
@@ -307,10 +247,8 @@ static int _lvname_disp(struct dm_report *rh, struct dm_pool *mem,
 	char *repstr, *lvname;
 	size_t len;
 
-	if (lv_is_visible(lv)) {
-		repstr = lv->name;
-		return dm_report_field_string(rh, field, (const char **) &repstr);
-	}
+	if (lv_is_visible(lv))
+		return dm_report_field_string(rh, field, &lv->name);
 
 	len = strlen(lv->name) + 3;
 	if (!(repstr = dm_pool_zalloc(mem, len))) {
@@ -330,6 +268,51 @@ static int _lvname_disp(struct dm_report *rh, struct dm_pool *mem,
 
 	dm_report_field_set_value(field, repstr, lvname);
 
+	return 1;
+}
+
+static int _datalv_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
+			struct dm_report_field *field,
+			const void *data, void *private __attribute__((unused)))
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+
+	if (lv_is_thin_pool(lv))
+		return _lvname_disp(rh, mem, field,
+				    seg_lv(first_seg(lv), 0), private);
+
+	dm_report_field_set_value(field, "", NULL);
+	return 1;
+}
+
+static int _metadatalv_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
+			    struct dm_report_field *field,
+			    const void *data, void *private __attribute__((unused)))
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+
+	if (lv_is_thin_pool(lv))
+		return _lvname_disp(rh, mem, field,
+				    first_seg(lv)->metadata_lv, private);
+
+	dm_report_field_set_value(field, "", NULL);
+	return 1;
+}
+
+static int _poollv_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
+			struct dm_report_field *field,
+			const void *data, void *private __attribute__((unused)))
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	struct lv_segment *seg;
+
+	if (lv_is_thin_volume(lv))
+		dm_list_iterate_items(seg, &lv->segments)
+			if (seg_is_thin_volume(seg))
+				return _lvname_disp(rh, mem, field,
+						    seg->pool_lv, private);
+
+	dm_report_field_set_value(field, "", NULL);
 	return 1;
 }
 
@@ -356,6 +339,9 @@ static int _origin_disp(struct dm_report *rh, struct dm_pool *mem,
 
 	if (lv_is_cow(lv))
 		return _lvname_disp(rh, mem, field, origin_from_cow(lv), private);
+
+	if (lv_is_thin_volume(lv) && first_seg(lv)->origin)
+		return _lvname_disp(rh, mem, field, first_seg(lv)->origin, private);
 
 	dm_report_field_set_value(field, "", NULL);
 	return 1;
@@ -411,7 +397,7 @@ static int _size32_disp(struct dm_report *rh __attribute__((unused)), struct dm_
 		return 0;
 	}
 
-	*sortval = (const uint64_t) size;
+	*sortval = (uint64_t) size;
 
 	dm_report_field_set_value(field, repstr, sortval);
 
@@ -444,6 +430,20 @@ static int _size64_disp(struct dm_report *rh __attribute__((unused)),
 	dm_report_field_set_value(field, repstr, sortval);
 
 	return 1;
+}
+
+static int _uint32_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
+			struct dm_report_field *field,
+			const void *data, void *private __attribute__((unused)))
+{
+	return dm_report_field_uint32(rh, field, data);
+}
+
+static int _int32_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
+		       struct dm_report_field *field,
+		       const void *data, void *private __attribute__((unused)))
+{
+	return dm_report_field_int32(rh, field, data);
 }
 
 static int _lvreadahead_disp(struct dm_report *rh, struct dm_pool *mem,
@@ -533,6 +533,56 @@ static int _chunksize_disp(struct dm_report *rh, struct dm_pool *mem,
 	return _size64_disp(rh, mem, field, &size, private);
 }
 
+static int _thinzero_disp(struct dm_report *rh, struct dm_pool *mem,
+			   struct dm_report_field *field,
+			   const void *data, void *private)
+{
+	const struct lv_segment *seg = (const struct lv_segment *) data;
+
+	/* Suppress thin count if not thin pool */
+	if (!seg_is_thin_pool(seg)) {
+		dm_report_field_set_value(field, "", NULL);
+		return 1;
+	}
+
+	return _uint32_disp(rh, mem, field, &seg->zero_new_blocks, private);
+}
+
+static int _transactionid_disp(struct dm_report *rh, struct dm_pool *mem,
+				struct dm_report_field *field,
+				const void *data, void *private)
+{
+	const struct lv_segment *seg = (const struct lv_segment *) data;
+
+	/* Suppress thin count if not thin pool */
+	if (!seg_is_thin_pool(seg)) {
+		dm_report_field_set_value(field, "", NULL);
+		return 1;
+	}
+
+	return  dm_report_field_uint64(rh, field, &seg->transaction_id);
+}
+
+static int _discards_disp(struct dm_report *rh, struct dm_pool *mem,
+			  struct dm_report_field *field,
+			  const void *data, void *private)
+{
+	const struct lv_segment *seg = (const struct lv_segment *) data;
+	const char *discards_str;
+
+	if (seg_is_thin_volume(seg))
+		seg = first_seg(seg->pool_lv);
+
+	if (seg_is_thin_pool(seg)) {
+		discards_str = get_pool_discards_name(seg->discards);
+		return dm_report_field_string(rh, field, &discards_str);
+	}
+
+	dm_report_field_set_value(field, "", NULL);
+
+	return 1;
+}
+
 static int _originsize_disp(struct dm_report *rh, struct dm_pool *mem,
 			    struct dm_report_field *field,
 			    const void *data, void *private)
@@ -615,25 +665,11 @@ static int _uuid_disp(struct dm_report *rh __attribute__((unused)), struct dm_po
 {
 	char *repstr = NULL;
 
-	if (!(repstr = id_format_and_copy(mem, (struct id *)data)))
+	if (!(repstr = id_format_and_copy(mem, data)))
 		return_0;
 
 	dm_report_field_set_value(field, repstr, NULL);
 	return 1;
-}
-
-static int _uint32_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
-			struct dm_report_field *field,
-			const void *data, void *private __attribute__((unused)))
-{
-	return dm_report_field_uint32(rh, field, data);
-}
-
-static int _int32_disp(struct dm_report *rh, struct dm_pool *mem __attribute__((unused)),
-		       struct dm_report_field *field,
-		       const void *data, void *private __attribute__((unused)))
-{
-	return dm_report_field_int32(rh, field, data);
 }
 
 static int _pvmdas_disp(struct dm_report *rh, struct dm_pool *mem,
@@ -818,7 +854,7 @@ static int _snpercent_disp(struct dm_report *rh __attribute__((unused)), struct 
 	}
 
 	if (!lv_snapshot_percent(lv, &snap_percent) ||
-				 (snap_percent == PERCENT_INVALID)) {
+	    (snap_percent == PERCENT_INVALID) || (snap_percent == PERCENT_MERGE_FAILED)) {
 		if (!lv_is_merging_origin(lv)) {
 			*sortval = UINT64_C(100);
 			dm_report_field_set_value(field, "100.00", sortval);
@@ -853,7 +889,7 @@ static int _copypercent_disp(struct dm_report *rh __attribute__((unused)),
 			     struct dm_report_field *field,
 			     const void *data, void *private __attribute__((unused)))
 {
-	struct logical_volume *lv = (struct logical_volume *) data;
+	const struct logical_volume *lv = (const struct logical_volume *) data;
 	percent_t percent;
 	uint64_t *sortval;
 	char *repstr;
@@ -889,6 +925,155 @@ static int _copypercent_disp(struct dm_report *rh __attribute__((unused)),
 	return 1;
 }
 
+static int _dtpercent_disp(int metadata, struct dm_report *rh,
+			   struct dm_pool *mem,
+			   struct dm_report_field *field,
+			   const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	struct lvinfo info;
+	percent_t percent;
+	uint64_t *sortval;
+	char *repstr;
+
+	/* Suppress data percent if not thin pool/volume or not using driver */
+	if (!lv_info(lv->vg->cmd, lv, 1, &info, 0, 0) || !info.exists) {
+		dm_report_field_set_value(field, "", NULL);
+		return 1;
+	}
+
+	if (!(sortval = dm_pool_zalloc(mem, sizeof(uint64_t)))) {
+		log_error("Failed to allocate sortval.");
+		return 0;
+	}
+
+	if (lv_is_thin_pool(lv)) {
+		if (!lv_thin_pool_percent(lv, metadata, &percent))
+			return_0;
+	} else { /* thin_volume */
+		if (!lv_thin_percent(lv, 0, &percent))
+			return_0;
+	}
+
+	if (!(repstr = dm_pool_alloc(mem, 8))) {
+		log_error("Failed to allocate report buffer.");
+		return 0;
+	}
+
+	if (dm_snprintf(repstr, 8, "%.2f", percent_to_float(percent)) < 0) {
+		log_error("Data percentage too large.");
+		return 0;
+	}
+
+	*sortval = (uint64_t)(percent * 1000.f);
+	dm_report_field_set_value(field, repstr, sortval);
+
+	return 1;
+}
+
+static int _datapercent_disp(struct dm_report *rh, struct dm_pool *mem,
+			     struct dm_report_field *field,
+			     const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+
+	if (lv_is_cow(lv))
+		return _snpercent_disp(rh, mem, field, data, private);
+
+	if (lv_is_thin_pool(lv) || lv_is_thin_volume(lv))
+		return _dtpercent_disp(0, rh, mem, field, data, private);
+
+	dm_report_field_set_value(field, "", NULL);
+
+	return 1;
+}
+
+static int _metadatapercent_disp(struct dm_report *rh, struct dm_pool *mem,
+				 struct dm_report_field *field,
+				 const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+
+	if (lv_is_thin_pool(lv))
+		return _dtpercent_disp(1, rh, mem, field, data, private);
+
+	dm_report_field_set_value(field, "", NULL);
+
+	return 1;
+}
+
+static int _lvmetadatasize_disp(struct dm_report *rh, struct dm_pool *mem,
+				struct dm_report_field *field,
+				const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	uint64_t size;
+
+	if (!lv_is_thin_pool(lv)) {
+		dm_report_field_set_value(field, "", NULL);
+		return 1;
+	}
+
+	size = lv_metadata_size(lv);
+
+	return _size64_disp(rh, mem, field, &size, private);
+}
+
+static int _thincount_disp(struct dm_report *rh, struct dm_pool *mem,
+                         struct dm_report_field *field,
+                         const void *data, void *private)
+{
+	const struct lv_segment *seg = (const struct lv_segment *) data;
+	uint32_t count;
+
+	/* Suppress thin count if not thin pool */
+	if (!seg_is_thin_pool(seg)) {
+		dm_report_field_set_value(field, "", NULL);
+		return 1;
+	}
+
+	count = dm_list_size(&seg->lv->segs_using_this_lv);
+
+	return _uint32_disp(rh, mem, field, &count, private);
+}
+
+static int _lvtime_disp(struct dm_report *rh, struct dm_pool *mem,
+			struct dm_report_field *field,
+			const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	char *repstr;
+	uint64_t *sortval;
+
+	if (!(sortval = dm_pool_zalloc(mem, sizeof(uint64_t)))) {
+		log_error("Failed to allocate sortval.");
+		return 0;
+	}
+
+	*sortval = lv->timestamp;
+	if (!(repstr = lv_time_dup(mem, lv)))
+		return_0;
+
+	dm_report_field_set_value(field, repstr, sortval);
+
+	return 1;
+}
+
+static int _lvhost_disp(struct dm_report *rh, struct dm_pool *mem,
+			struct dm_report_field *field,
+			const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	char *repstr;
+
+	if (!(repstr = lv_host_dup(mem, lv)))
+		return_0;
+
+	dm_report_field_set_value(field, repstr, repstr);
+
+	return 1;
+}
+
 /* Report object types */
 
 /* necessary for displaying something for PVs not belonging to VG */
@@ -899,7 +1084,7 @@ static struct format_instance _dummy_fid = {
 
 static struct volume_group _dummy_vg = {
 	.fid = &_dummy_fid,
-	.name = (char *) "",
+	.name = "",
 	.system_id = (char *) "",
 	.pvs = { &(_dummy_vg.pvs), &(_dummy_vg.pvs) },
 	.lvs = { &(_dummy_vg.lvs), &(_dummy_vg.lvs) },

@@ -197,14 +197,13 @@ static int add_internal_client(int fd, fd_callback_t callback)
 
 	DEBUGLOG("Add_internal_client, fd = %d\n", fd);
 
-	client = malloc(sizeof(struct local_client));
+	client = calloc(1, sizeof(struct local_client));
 	if (!client)
 	{
 		DEBUGLOG("malloc failed\n");
 		return -1;
 	}
 
-	memset(client, 0, sizeof(struct local_client));
 	client->fd = fd;
 	client->type = CLUSTER_INTERNAL;
 	client->callback = callback;
@@ -227,7 +226,7 @@ static void openais_cpg_deliver_callback (cpg_handle_t handle,
 
 	memcpy(&target_nodeid, msg, OPENAIS_CSID_LEN);
 
-	DEBUGLOG("%u got message from nodeid %d for %d. len %d\n",
+	DEBUGLOG("%u got message from nodeid %d for %d. len %" PRIsize_t "\n",
 		 our_nodeid, nodeid, target_nodeid, msg_len-4);
 
 	if (nodeid != our_nodeid)
@@ -245,7 +244,8 @@ static void openais_cpg_confchg_callback(cpg_handle_t handle,
 	int i;
 	struct node_info *ninfo;
 
-	DEBUGLOG("confchg callback. %d joined, %d left, %d members\n",
+	DEBUGLOG("confchg callback. %" PRIsize_t " joined, "
+		 "%" PRIsize_t " left, %" PRIsize_t " members\n",
 		 joined_list_entries, left_list_entries, member_list_entries);
 
 	for (i=0; i<joined_list_entries; i++) {
@@ -505,11 +505,11 @@ static int _lock_resource(char *resource, int mode, int flags, int *lockid)
 		saLckResourceClose(res_handle);
 		return ais_to_errno(err);
 	}
-			
+
 	/* Wait for it to complete */
 
-	DEBUGLOG("lock_resource returning %d, lock_id=%llx\n", err,
-		 lock_id);
+	DEBUGLOG("lock_resource returning %d, lock_id=%" PRIx64 "\n",
+		 err, lock_id);
 
 	linfo->lock_id = lock_id;
 	linfo->res_handle = res_handle;
@@ -530,7 +530,7 @@ static int _unlock_resource(char *resource, int lockid)
 	if (!linfo)
 		return 0;
 
-	DEBUGLOG("unlock_resource: lockid: %llx\n", linfo->lock_id);
+	DEBUGLOG("unlock_resource: lockid: %" PRIx64 "\n", linfo->lock_id);
 	err = saLckResourceUnlock(linfo->lock_id, SA_TIME_END);
 	if (err != SA_AIS_OK)
 	{
@@ -666,6 +666,7 @@ static int _get_cluster_name(char *buf, int buflen)
 }
 
 static struct cluster_ops _cluster_openais_ops = {
+	.name                     = "openais",
 	.cluster_init_completed   = NULL,
 	.cluster_send_message     = _cluster_send_message,
 	.name_from_csid           = _name_from_csid,

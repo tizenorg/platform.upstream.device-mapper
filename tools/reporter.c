@@ -51,7 +51,6 @@ static int _segs_single(struct cmd_context *cmd __attribute__((unused)),
 
 	return ECMD_PROCESSED;
 }
-
 static int _pvsegs_sub_single(struct cmd_context *cmd,
 			      struct volume_group *vg,
 			      struct pv_segment *pvseg, void *handle)
@@ -61,15 +60,13 @@ static int _pvsegs_sub_single(struct cmd_context *cmd,
 
 	struct volume_group _free_vg = {
 		.cmd = cmd,
-		.name = (char *)"",
+		.name = "",
+		.vgmem = NULL,
 	};
-
-        if (!(_free_vg.vgmem = dm_pool_create("_free_vg", 10240)))
-		return ECMD_FAILED;
 
 	struct logical_volume _free_logical_volume = {
 		.vg = vg ?: &_free_vg,
-		.name = (char *) "",
+		.name = "",
 		.snapshot = NULL,
 		.status = VISIBLE_LV,
 		.major = -1,
@@ -109,8 +106,8 @@ static int _pvsegs_sub_single(struct cmd_context *cmd,
 		ret = ECMD_FAILED;
                 goto_out;
 	}
+
  out:
-	free_vg(&_free_vg);
 	return ret;
 }
 
@@ -145,7 +142,7 @@ static int _pvs_single(struct cmd_context *cmd, struct volume_group *vg,
 		vg = vg_read(cmd, vg_name, (char *)&pv->vgid, 0);
 		if (vg_read_error(vg)) {
 			log_error("Skipping volume group %s", vg_name);
-			free_vg(vg);
+			release_vg(vg);
 			return ECMD_FAILED;
 		}
 
@@ -185,7 +182,7 @@ out:
 		unlock_vg(cmd, vg_name);
 
 	if (!old_vg)
-		free_vg(vg);
+		release_vg(vg);
 
 	return ret;
 }
@@ -318,6 +315,9 @@ static int _report(struct cmd_context *cmd, int argc, char **argv,
 						  "report/pvsegs_cols_verbose",
 						  DEFAULT_PVSEGS_COLS_VERB);
 		break;
+	default:
+		log_error(INTERNAL_ERROR "Unknown report type.");
+		return ECMD_FAILED;
 	}
 
 	/* If -o supplied use it, else use default for report_type */

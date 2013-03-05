@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2011 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -31,10 +31,19 @@ typedef enum {
 	ALLOC_INHERIT
 } alloc_policy_t;
 
+struct pv_to_create {
+	struct dm_list list;
+	struct physical_volume *pv;
+	struct pvcreate_params *pp;
+};
+
+#define MAX_EXTENT_COUNT  (UINT32_MAX)
+
 struct volume_group {
 	struct cmd_context *cmd;
 	struct dm_pool *vgmem;
 	struct format_instance *fid;
+	struct lvmcache_vginfo *vginfo;
 	struct dm_list *cmd_vgs;/* List of wanted/locked and opened VGs */
 	uint32_t cmd_missing_vgs;/* Flag marks missing VG */
 	uint32_t seqno;		/* Metadata sequence number */
@@ -57,6 +66,13 @@ struct volume_group {
 	/* physical volumes */
 	uint32_t pv_count;
 	struct dm_list pvs;
+
+	/*
+	 * List of physical volumes that were used in vgextend but do not carry
+	 * a PV label yet. They need to be pvcreate'd at vg_write time.
+	 */
+
+	struct dm_list pvs_to_create;
 
 	/*
 	 * logical volumes
@@ -93,7 +109,19 @@ struct volume_group {
 	 */
 	uint32_t read_status;
 	uint32_t mda_copies; /* target number of mdas for this VG */
+
+	struct dm_hash_table *hostnames; /* map of creation hostnames */
 };
+
+struct volume_group *alloc_vg(const char *pool_name, struct cmd_context *cmd,
+			      const char *vg_name);
+
+/*
+ * release_vg() must be called on every struct volume_group allocated
+ * by vg_create() or vg_read_internal() to free it when no longer required.
+ */
+void release_vg(struct volume_group *vg);
+void free_orphan_vg(struct volume_group *vg);
 
 char *vg_fmt_dup(const struct volume_group *vg);
 char *vg_name_dup(const struct volume_group *vg);
@@ -117,10 +145,12 @@ uint32_t vg_mda_count(const struct volume_group *vg);
 uint32_t vg_mda_used_count(const struct volume_group *vg);
 uint32_t vg_mda_copies(const struct volume_group *vg);
 int vg_set_mda_copies(struct volume_group *vg, uint32_t mda_copies);
+
 /*
  * Returns visible LV count - number of LVs from user perspective
  */
 unsigned vg_visible_lvs(const struct volume_group *vg);
+
 /*
  * Count snapshot LVs.
  */

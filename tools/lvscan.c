@@ -19,8 +19,6 @@ static int lvscan_single(struct cmd_context *cmd, struct logical_volume *lv,
 			 void *handle __attribute__((unused)))
 {
 	struct lvinfo info;
-	int lv_total = 0;
-	uint64_t lv_capacity_total = 0;
 	int inkernel, snap_active = 1;
 	struct lv_segment *snap_seg = NULL;
 	percent_t snap_percent;     /* fused, fsize; */
@@ -30,7 +28,7 @@ static int lvscan_single(struct cmd_context *cmd, struct logical_volume *lv,
 	if (!arg_count(cmd, all_ARG) && !lv_is_visible(lv))
 		return ECMD_PROCESSED;
 
-	inkernel = lv_info(cmd, lv, 0, &info, 1, 0) && info.exists;
+	inkernel = lv_info(cmd, lv, 0, &info, 0, 0) && info.exists;
 	if (lv_is_origin(lv)) {
 		dm_list_iterate_items_gen(snap_seg, &lv->snapshot_segs,
 				       origin_list) {
@@ -61,14 +59,10 @@ static int lvscan_single(struct cmd_context *cmd, struct logical_volume *lv,
 	else
 		snapshot_str = "        ";
 
-	log_print("%s%s '%s%s/%s' [%s] %s", active_str, snapshot_str,
-		  cmd->dev_dir, lv->vg->name, lv->name,
-		  display_size(cmd, lv->size),
-		  get_alloc_string(lv->alloc));
-
-	lv_total++;
-
-	lv_capacity_total += lv->size;
+	log_print_unless_silent("%s%s '%s%s/%s' [%s] %s", active_str, snapshot_str,
+				cmd->dev_dir, lv->vg->name, lv->name,
+				display_size(cmd, lv->size),
+				get_alloc_string(lv->alloc));
 
 	return ECMD_PROCESSED;
 }

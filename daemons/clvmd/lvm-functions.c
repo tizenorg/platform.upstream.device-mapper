@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2002-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -109,10 +109,9 @@ static const char *decode_full_locking_cmd(uint32_t cmdl)
 		break;
 	}
 
-	sprintf(buf, "0x%x %s (%s|%s%s%s%s%s%s)", cmdl, command, type, scope,
+	sprintf(buf, "0x%x %s (%s|%s%s%s%s%s)", cmdl, command, type, scope,
 		cmdl & LCK_NONBLOCK   ? "|NONBLOCK" : "",
 		cmdl & LCK_HOLD       ? "|HOLD" : "",
-		cmdl & LCK_LOCAL      ? "|LOCAL" : "",
 		cmdl & LCK_CLUSTER_VG ? "|CLUSTER_VG" : "",
 		cmdl & LCK_CACHE      ? "|CACHE" : "");
 
@@ -132,12 +131,14 @@ static const char *decode_flags(unsigned char flags)
 	static char buf[128];
 	int len;
 
-	len = sprintf(buf, "0x%x ( %s%s%s%s%s)", flags,
+	len = sprintf(buf, "0x%x ( %s%s%s%s%s%s%s)", flags,
 		flags & LCK_PARTIAL_MODE	  ? "PARTIAL_MODE|" : "",
 		flags & LCK_MIRROR_NOSYNC_MODE	  ? "MIRROR_NOSYNC|" : "",
 		flags & LCK_DMEVENTD_MONITOR_MODE ? "DMEVENTD_MONITOR|" : "",
 		flags & LCK_ORIGIN_ONLY_MODE ? "ORIGIN_ONLY|" : "",
-		flags & LCK_CONVERT ? "CONVERT|" : "");
+		flags & LCK_TEST_MODE ? "TEST|" : "",
+		flags & LCK_CONVERT ? "CONVERT|" : "",
+		flags & LCK_DMEVENTD_MONITOR_IGNORE ? "DMEVENTD_MONITOR_IGNORE|" : "");
 
 	if (len > 1)
 		buf[len - 2] = ' ';
@@ -147,7 +148,7 @@ static const char *decode_flags(unsigned char flags)
 	return buf;
 }
 
-char *get_last_lvm_error()
+char *get_last_lvm_error(void)
 {
 	return last_error;
 }
@@ -166,11 +167,15 @@ static struct lv_info *lookup_info(const char *resource)
 	return lvi;
 }
 
-static void insert_info(const char *resource, struct lv_info *lvi)
+static int insert_info(const char *resource, struct lv_info *lvi)
 {
+	int ret;
+
 	pthread_mutex_lock(&lv_hash_lock);
-	dm_hash_insert(lv_hash, resource, lvi);
+	ret = dm_hash_insert(lv_hash, resource, lvi);
 	pthread_mutex_unlock(&lv_hash_lock);
+
+	return ret;
 }
 
 static void remove_info(const char *resource)
@@ -194,16 +199,16 @@ static int get_current_lock(char *resource)
 }
 
 
-void init_lvhash()
+void init_lvhash(void)
 {
 	/* Create hash table for keeping LV locks & status */
-	lv_hash = dm_hash_create(100);
+	lv_hash = dm_hash_create(1024);
 	pthread_mutex_init(&lv_hash_lock, NULL);
 	pthread_mutex_init(&lvm_lock, NULL);
 }
 
 /* Called at shutdown to tidy the lockspace */
-void destroy_lvhash()
+void destroy_lvhash(void)
 {
 	struct dm_hash_node *v;
 	struct lv_info *lvi;
@@ -235,14 +240,25 @@ static int hold_lock(char *resource, int mode, int flags)
 	int saved_errno;
 	struct lv_info *lvi;
 
+	if (test_mode())
+		return 0;
+
 	/* Mask off invalid options */
 	flags &= LCKF_NOQUEUE | LCKF_CONVERT;
 
 	lvi = lookup_info(resource);
 
-	if (lvi && lvi->lock_mode == mode) {
-		DEBUGLOG("hold_lock, lock mode %d already held\n", mode);
-		return 0;
+	if (lvi) {
+		if (lvi->lock_mode == mode) {
+			DEBUGLOG("hold_lock, lock mode %d already held\n",
+				 mode);
+			return 0;
+		}
+		if ((lvi->lock_mode == LCK_EXCL) && (mode == LCK_WRITE)) {
+			DEBUGLOG("hold_lock, lock already held LCK_EXCL, "
+				 "ignoring LCK_WRITE request");
+			return 0;
+		}
 	}
 
 	/* Only allow explicit conversions */
@@ -265,8 +281,10 @@ static int hold_lock(char *resource, int mode, int flags)
 		errno = saved_errno;
 	} else {
 		lvi = malloc(sizeof(struct lv_info));
-		if (!lvi)
+		if (!lvi) {
+			errno = ENOMEM;
 			return -1;
+		}
 
 		lvi->lock_mode = mode;
 		status = sync_lock(resource, mode, flags & ~LCKF_CONVERT, &lvi->lock_id);
@@ -276,7 +294,10 @@ static int hold_lock(char *resource, int mode, int flags)
 			DEBUGLOG("hold_lock. lock at %d failed: %s\n", mode,
 				 strerror(errno));
 		} else
-			insert_info(resource, lvi);
+			if (!insert_info(resource, lvi)) {
+				errno = ENOMEM;
+				return -1;
+			}
 
 		errno = saved_errno;
 	}
@@ -289,6 +310,9 @@ static int hold_unlock(char *resource)
 	struct lv_info *lvi;
 	int status;
 	int saved_errno;
+
+	if (test_mode())
+		return 0;
 
 	if (!(lvi = lookup_info(resource))) {
 		DEBUGLOG("hold_unlock, lock not already held\n");
@@ -316,7 +340,7 @@ static int hold_unlock(char *resource)
 */
 
 /* Activate LV exclusive or non-exclusive */
-static int do_activate_lv(char *resource, unsigned char lock_flags, int mode)
+static int do_activate_lv(char *resource, unsigned char command, unsigned char lock_flags, int mode)
 {
 	int oldmode;
 	int status;
@@ -326,7 +350,7 @@ static int do_activate_lv(char *resource, unsigned char lock_flags, int mode)
 
 	/* Is it already open ? */
 	oldmode = get_current_lock(resource);
-	if (oldmode == mode && (lock_flags & LCK_CLUSTER_VG)) {
+	if (oldmode == mode && (command & LCK_CLUSTER_VG)) {
 		DEBUGLOG("do_activate_lv, lock already held at %d\n", oldmode);
 		return 0;	/* Nothing to do */
 	}
@@ -349,7 +373,7 @@ static int do_activate_lv(char *resource, unsigned char lock_flags, int mode)
 	 * Use lock conversion only if requested, to prevent implicit conversion
 	 * of exclusive lock to shared one during activation.
 	 */
-	if (lock_flags & LCK_CLUSTER_VG) {
+	if (command & LCK_CLUSTER_VG) {
 		status = hold_lock(resource, mode, LCKF_NOQUEUE | (lock_flags & LCK_CONVERT ? LCKF_CONVERT:0));
 		if (status) {
 			/* Return an LVM-sensible error for this.
@@ -369,9 +393,9 @@ static int do_activate_lv(char *resource, unsigned char lock_flags, int mode)
 		goto error;
 
 	if (lvi.suspended) {
-		memlock_inc(cmd);
+		critical_section_inc(cmd, "resuming");
 		if (!lv_resume(cmd, resource, 0)) {
-			memlock_dec(cmd);
+			critical_section_dec(cmd, "resumed");
 			goto error;
 		}
 	}
@@ -389,55 +413,62 @@ error:
 }
 
 /* Resume the LV if it was active */
-static int do_resume_lv(char *resource, unsigned char lock_flags)
+static int do_resume_lv(char *resource, unsigned char command, unsigned char lock_flags)
 {
-	int oldmode;
+	int oldmode, origin_only, exclusive, revert;
 
 	/* Is it open ? */
 	oldmode = get_current_lock(resource);
-	if (oldmode == -1 && (lock_flags & LCK_CLUSTER_VG)) {
+	if (oldmode == -1 && (command & LCK_CLUSTER_VG)) {
 		DEBUGLOG("do_resume_lv, lock not already held\n");
 		return 0;	/* We don't need to do anything */
 	}
+	origin_only = (lock_flags & LCK_ORIGIN_ONLY_MODE) ? 1 : 0;
+	exclusive = (oldmode == LCK_EXCL) ? 1 : 0;
+	revert = (lock_flags & LCK_REVERT_MODE) ? 1 : 0;
 
-	if (!lv_resume_if_active(cmd, resource, (lock_flags & LCK_ORIGIN_ONLY_MODE) ? 1 : 0))
+	if (!lv_resume_if_active(cmd, resource, origin_only, exclusive, revert))
 		return EIO;
 
 	return 0;
 }
 
 /* Suspend the device if active */
-static int do_suspend_lv(char *resource, unsigned char lock_flags)
+static int do_suspend_lv(char *resource, unsigned char command, unsigned char lock_flags)
 {
 	int oldmode;
 	struct lvinfo lvi;
 	unsigned origin_only = (lock_flags & LCK_ORIGIN_ONLY_MODE) ? 1 : 0;
+	unsigned exclusive;
 
 	/* Is it open ? */
 	oldmode = get_current_lock(resource);
-	if (oldmode == -1 && (lock_flags & LCK_CLUSTER_VG)) {
+	if (oldmode == -1 && (command & LCK_CLUSTER_VG)) {
 		DEBUGLOG("do_suspend_lv, lock not already held\n");
 		return 0; /* Not active, so it's OK */
 	}
+
+	exclusive = (oldmode == LCK_EXCL) ? 1 : 0;
 
 	/* Only suspend it if it exists */
 	if (!lv_info_by_lvid(cmd, resource, origin_only, &lvi, 0, 0))
 		return EIO;
 
-	if (lvi.exists && !lv_suspend_if_active(cmd, resource, origin_only))
+	if (lvi.exists &&
+	    !lv_suspend_if_active(cmd, resource, origin_only, exclusive))
 		return EIO;
 
 	return 0;
 }
 
-static int do_deactivate_lv(char *resource, unsigned char lock_flags)
+static int do_deactivate_lv(char *resource, unsigned char command, unsigned char lock_flags)
 {
 	int oldmode;
 	int status;
 
 	/* Is it open ? */
 	oldmode = get_current_lock(resource);
-	if (oldmode == -1 && (lock_flags & LCK_CLUSTER_VG)) {
+	if (oldmode == -1 && (command & LCK_CLUSTER_VG)) {
 		DEBUGLOG("do_deactivate_lock, lock not already held\n");
 		return 0;	/* We don't need to do anything */
 	}
@@ -445,7 +476,7 @@ static int do_deactivate_lv(char *resource, unsigned char lock_flags)
 	if (!lv_deactivate(cmd, resource))
 		return EIO;
 
-	if (lock_flags & LCK_CLUSTER_VG) {
+	if (command & LCK_CLUSTER_VG) {
 		status = hold_unlock(resource);
 		if (status)
 			return errno;
@@ -479,8 +510,8 @@ int do_lock_lv(unsigned char command, unsigned char lock_flags, char *resource)
 {
 	int status = 0;
 
-	DEBUGLOG("do_lock_lv: resource '%s', cmd = %s, flags = %s, memlock = %d\n",
-		 resource, decode_locking_cmd(command), decode_flags(lock_flags), memlock());
+	DEBUGLOG("do_lock_lv: resource '%s', cmd = %s, flags = %s, critical_section = %d\n",
+		 resource, decode_locking_cmd(command), decode_flags(lock_flags), critical_section());
 
 	if (!cmd->config_valid || config_files_changed(cmd)) {
 		/* Reinitialise various settings inc. logging, filters */
@@ -494,10 +525,14 @@ int do_lock_lv(unsigned char command, unsigned char lock_flags, char *resource)
 	if (lock_flags & LCK_MIRROR_NOSYNC_MODE)
 		init_mirror_in_sync(1);
 
-	if (lock_flags & LCK_DMEVENTD_MONITOR_MODE)
-		init_dmeventd_monitor(1);
-	else
-		init_dmeventd_monitor(0);
+	if (lock_flags & LCK_DMEVENTD_MONITOR_IGNORE)
+		init_dmeventd_monitor(DMEVENTD_MONITOR_IGNORE);
+	else {
+		if (lock_flags & LCK_DMEVENTD_MONITOR_MODE)
+			init_dmeventd_monitor(1);
+		else
+			init_dmeventd_monitor(0);
+	}
 
 	cmd->partial_activation = (lock_flags & LCK_PARTIAL_MODE) ? 1 : 0;
 
@@ -506,24 +541,24 @@ int do_lock_lv(unsigned char command, unsigned char lock_flags, char *resource)
 
 	switch (command & LCK_MASK) {
 	case LCK_LV_EXCLUSIVE:
-		status = do_activate_lv(resource, lock_flags, LCK_EXCL);
+		status = do_activate_lv(resource, command, lock_flags, LCK_EXCL);
 		break;
 
 	case LCK_LV_SUSPEND:
-		status = do_suspend_lv(resource, lock_flags);
+		status = do_suspend_lv(resource, command, lock_flags);
 		break;
 
 	case LCK_UNLOCK:
 	case LCK_LV_RESUME:	/* if active */
-		status = do_resume_lv(resource, lock_flags);
+		status = do_resume_lv(resource, command, lock_flags);
 		break;
 
 	case LCK_LV_ACTIVATE:
-		status = do_activate_lv(resource, lock_flags, LCK_READ);
+		status = do_activate_lv(resource, command, lock_flags, LCK_READ);
 		break;
 
 	case LCK_LV_DEACTIVATE:
-		status = do_deactivate_lv(resource, lock_flags);
+		status = do_deactivate_lv(resource, command, lock_flags);
 		break;
 
 	default:
@@ -541,7 +576,7 @@ int do_lock_lv(unsigned char command, unsigned char lock_flags, char *resource)
 	dm_pool_empty(cmd->mem);
 	pthread_mutex_unlock(&lvm_lock);
 
-	DEBUGLOG("Command return is %d, memlock is %d\n", status, memlock());
+	DEBUGLOG("Command return is %d, critical_section is %d\n", status, critical_section());
 	return status;
 }
 
@@ -554,7 +589,7 @@ int pre_lock_lv(unsigned char command, unsigned char lock_flags, char *resource)
 	   LCKF_CONVERT is used always, local node is going to modify metadata
 	 */
 	if ((command & (LCK_SCOPE_MASK | LCK_TYPE_MASK)) == LCK_LV_SUSPEND &&
-	    (lock_flags & LCK_CLUSTER_VG)) {
+	    (command & LCK_CLUSTER_VG)) {
 		DEBUGLOG("pre_lock_lv: resource '%s', cmd = %s, flags = %s\n",
 			 resource, decode_locking_cmd(command), decode_flags(lock_flags));
 
@@ -573,7 +608,7 @@ int post_lock_lv(unsigned char command, unsigned char lock_flags,
 
 	/* Opposite of above, done on resume after a metadata update */
 	if ((command & (LCK_SCOPE_MASK | LCK_TYPE_MASK)) == LCK_LV_RESUME &&
-	    (lock_flags & LCK_CLUSTER_VG)) {
+	    (command & LCK_CLUSTER_VG)) {
 		int oldmode;
 
 		DEBUGLOG
@@ -611,7 +646,7 @@ int do_check_lvm1(const char *vgname)
 	return status == 1 ? 0 : EBUSY;
 }
 
-int do_refresh_cache()
+int do_refresh_cache(void)
 {
 	DEBUGLOG("Refreshing context\n");
 	log_notice("Refreshing context");
@@ -633,46 +668,6 @@ int do_refresh_cache()
 	return 0;
 }
 
-
-/* Only called at gulm startup. Drop any leftover VG or P_orphan locks
-   that might be hanging around if we died for any reason
-*/
-static void drop_vg_locks(void)
-{
-	char vg[128];
-	char line[255];
-	FILE *vgs =
-	    popen
-	    (LVM_PATH " pvs  --config 'log{command_names=0 prefix=\"\"}' --nolocking --noheadings -o vg_name", "r");
-
-	sync_unlock("P_" VG_ORPHANS, LCK_EXCL);
-	sync_unlock("P_" VG_GLOBAL, LCK_EXCL);
-
-	if (!vgs)
-		return;
-
-	while (fgets(line, sizeof(line), vgs)) {
-		char *vgend;
-		char *vgstart;
-
-		if (line[strlen(line)-1] == '\n')
-			line[strlen(line)-1] = '\0';
-
-		vgstart = line + strspn(line, " ");
-		vgend = vgstart + strcspn(vgstart, " ");
-		*vgend = '\0';
-
-		if (strncmp(vgstart, "WARNING:", 8) == 0)
-			continue;
-
-		sprintf(vg, "V_%s", vgstart);
-		sync_unlock(vg, LCK_EXCL);
-
-	}
-	if (fclose(vgs))
-		DEBUGLOG("vgs fclose failed: %s\n", strerror(errno));
-}
-
 /*
  * Handle VG lock - drop metadata or update lvmcache state
  */
@@ -689,8 +684,8 @@ void do_lock_vg(unsigned char command, unsigned char lock_flags, char *resource)
 	if (strncmp(resource, "P_#", 3) && !strncmp(resource, "P_", 2))
 		lock_cmd |= LCK_CACHE;
 
-	DEBUGLOG("do_lock_vg: resource '%s', cmd = %s, flags = %s, memlock = %d\n",
-		 resource, decode_full_locking_cmd(lock_cmd), decode_flags(lock_flags), memlock());
+	DEBUGLOG("do_lock_vg: resource '%s', cmd = %s, flags = %s, critical_section = %d\n",
+		 resource, decode_full_locking_cmd(lock_cmd), decode_flags(lock_flags), critical_section());
 
 	/* P_#global causes a full cache refresh */
 	if (!strcmp(resource, "P_" VG_GLOBAL)) {
@@ -717,49 +712,33 @@ void do_lock_vg(unsigned char command, unsigned char lock_flags, char *resource)
 }
 
 /*
- * Compare the uuid with the list of exclusive locks that clvmd
- * held before it was restarted, so we can get the right kind
- * of lock now we are restarting.
- */
-static int was_ex_lock(char *uuid, char **argv)
-{
-	int optnum = 0;
-	char *opt = argv[optnum];
-
-	while (opt) {
-		if (strcmp(opt, "-E") == 0) {
-			opt = argv[++optnum];
-			if (opt && (strcmp(opt, uuid) == 0)) {
-				DEBUGLOG("Lock %s is exclusive\n", uuid);
-				return 1;
-			}
-		}
-		opt = argv[++optnum];
-	}
-	return 0;
-}
-
-/*
  * Ideally, clvmd should be started before any LVs are active
  * but this may not be the case...
  * I suppose this also comes in handy if clvmd crashes, not that it would!
  */
-static void *get_initial_state(char **argv)
+static int get_initial_state(struct dm_hash_table *excl_uuid)
 {
 	int lock_mode;
 	char lv[64], vg[64], flags[25], vg_flags[25];
 	char uuid[65];
 	char line[255];
-	FILE *lvs =
-	    popen
-	    (LVM_PATH " lvs  --config 'log{command_names=0 prefix=\"\"}' --nolocking --noheadings -o vg_uuid,lv_uuid,lv_attr,vg_attr",
-	     "r");
+	char *lvs_cmd;
+	const char *lvm_binary = getenv("LVM_BINARY") ? : LVM_PATH;
+	FILE *lvs;
 
-	if (!lvs)
-		return NULL;
+	if (dm_asprintf(&lvs_cmd, "%s lvs  --config 'log{command_names=0 prefix=\"\"}' "
+			"--nolocking --noheadings -o vg_uuid,lv_uuid,lv_attr,vg_attr",
+			lvm_binary) < 0)
+		return_0;
+
+	/* FIXME: Maybe link and use liblvm2cmd directly instead of fork */
+	if (!(lvs = popen(lvs_cmd, "r"))) {
+		dm_free(lvs_cmd);
+		return 0;
+	}
 
 	while (fgets(line, sizeof(line), lvs)) {
-	        if (sscanf(line, "%s %s %s %s\n", vg, lv, flags, vg_flags) == 4) {
+	        if (sscanf(line, "%64s %64s %25s %25s\n", vg, lv, flags, vg_flags) == 4) {
 
 			/* States: s:suspended a:active S:dropped snapshot I:invalid snapshot */
 		        if (strlen(vg) == 38 &&                         /* is is a valid UUID ? */
@@ -782,21 +761,23 @@ static void *get_initial_state(char **argv)
 				memcpy(&uuid[58], &lv[32], 6);
 				uuid[64] = '\0';
 
-				lock_mode = LCK_READ;
-
 				/* Look for this lock in the list of EX locks
 				   we were passed on the command-line */
-				if (was_ex_lock(uuid, argv))
-					lock_mode = LCK_EXCL;
+				lock_mode = (dm_hash_lookup(excl_uuid, uuid)) ?
+					LCK_EXCL : LCK_READ;
 
 				DEBUGLOG("getting initial lock for %s\n", uuid);
-				hold_lock(uuid, lock_mode, LCKF_NOQUEUE);
+				if (hold_lock(uuid, lock_mode, LCKF_NOQUEUE))
+					DEBUGLOG("Failed to hold lock %s\n", uuid);
 			}
 		}
 	}
 	if (fclose(lvs))
 		DEBUGLOG("lvs fclose failed: %s\n", strerror(errno));
-	return NULL;
+
+	dm_free(lvs_cmd);
+
+	return 1;
 }
 
 static void lvm2_log_fn(int level, const char *file, int line, int dm_errno,
@@ -863,7 +844,7 @@ void lvm_do_backup(const char *vgname)
 	else
 		log_error("Error backing up metadata, can't find VG for group %s", vgname);
 
-	free_vg(vg);
+	release_vg(vg);
 	dm_pool_empty(cmd->mem);
 
 	pthread_mutex_unlock(&lvm_lock);
@@ -894,10 +875,26 @@ struct dm_hash_node *get_next_excl_lock(struct dm_hash_node *v, char **name)
 	return v;
 }
 
-/* Called to initialise the LVM context of the daemon */
-int init_clvm(int using_gulm, char **argv)
+void lvm_do_fs_unlock(void)
 {
-	if (!(cmd = create_toolcontext(1, NULL))) {
+	pthread_mutex_lock(&lvm_lock);
+	DEBUGLOG("Syncing device names\n");
+	fs_unlock();
+	pthread_mutex_unlock(&lvm_lock);
+}
+
+/* Called to initialise the LVM context of the daemon */
+int init_clvm(struct dm_hash_table *excl_uuid)
+{
+	/* Use LOG_DAEMON for syslog messages instead of LOG_USER */
+	init_syslog(LOG_DAEMON);
+	openlog("clvmd", LOG_PID, LOG_DAEMON);
+
+	/* Initialise already held locks */
+	if (!get_initial_state(excl_uuid))
+		log_error("Cannot load initial lock states.");
+
+	if (!(cmd = create_toolcontext(1, NULL, 0, 1))) {
 		log_error("Failed to allocate command context");
 		return 0;
 	}
@@ -907,20 +904,11 @@ int init_clvm(int using_gulm, char **argv)
 		return 0;
 	}
 
-	/* Use LOG_DAEMON for syslog messages instead of LOG_USER */
-	init_syslog(LOG_DAEMON);
-	openlog("clvmd", LOG_PID, LOG_DAEMON);
 	cmd->cmd_line = "clvmd";
 
 	/* Check lvm.conf is setup for cluster-LVM */
 	check_config();
 	init_ignore_suspended_devices(1);
-
-	/* Remove any non-LV locks that may have been left around */
-	if (using_gulm)
-		drop_vg_locks();
-
-	get_initial_state(argv);
 
 	/* Trap log messages so we can pass them back to the user */
 	init_log_fn(lvm2_log_fn);

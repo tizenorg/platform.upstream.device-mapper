@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2007 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -15,6 +15,9 @@
 
 #include "tools.h"
 
+#include "lvmetad.h"
+#include "lvmcache.h"
+
 int pv_max_name_len = 0;
 int vg_max_name_len = 0;
 
@@ -25,13 +28,13 @@ static void _pvscan_display_single(struct cmd_context *cmd,
 	char uuid[64] __attribute__((aligned(8)));
 	unsigned vg_name_len = 0;
 
-	char pv_tmp_name[NAME_LEN] = { 0, };
-	char vg_tmp_name[NAME_LEN] = { 0, };
-	char vg_name_this[NAME_LEN] = { 0, };
+	char pv_tmp_name[NAME_LEN] = { 0 };
+	char vg_tmp_name[NAME_LEN] = { 0 };
+	char vg_name_this[NAME_LEN] = { 0 };
 
 	/* short listing? */
 	if (arg_count(cmd, short_ARG) > 0) {
-		log_print("%s", pv_dev_name(pv));
+		log_print_unless_silent("%s", pv_dev_name(pv));
 		return;
 	}
 
@@ -45,8 +48,6 @@ static void _pvscan_display_single(struct cmd_context *cmd,
 		/* log_print(" "); */
 		/* return; */
 	}
-
-	memset(pv_tmp_name, 0, sizeof(pv_tmp_name));
 
 	vg_name_len = strlen(pv_vg_name(pv)) + 1;
 
@@ -63,41 +64,156 @@ static void _pvscan_display_single(struct cmd_context *cmd,
 	}
 
 	if (is_orphan(pv)) {
-		log_print("PV %-*s    %-*s %s [%s]",
-			  pv_max_name_len, pv_tmp_name,
-			  vg_max_name_len, " ",
-			  pv->fmt ? pv->fmt->name : "    ",
-			  display_size(cmd, pv_size(pv)));
+		log_print_unless_silent("PV %-*s    %-*s %s [%s]",
+					pv_max_name_len, pv_tmp_name,
+					vg_max_name_len, " ",
+					pv->fmt ? pv->fmt->name : "    ",
+					display_size(cmd, pv_size(pv)));
 		return;
 	}
 
 	if (pv_status(pv) & EXPORTED_VG) {
 		strncpy(vg_name_this, pv_vg_name(pv), vg_name_len);
-		log_print("PV %-*s  is in exported VG %s "
-			  "[%s / %s free]",
-			  pv_max_name_len, pv_tmp_name,
-			  vg_name_this,
-			  display_size(cmd, (uint64_t) pv_pe_count(pv) *
-				       pv_pe_size(pv)),
-			  display_size(cmd, (uint64_t) (pv_pe_count(pv) -
-						pv_pe_alloc_count(pv))
-				       * pv_pe_size(pv)));
+		log_print_unless_silent("PV %-*s  is in exported VG %s "
+					"[%s / %s free]",
+					pv_max_name_len, pv_tmp_name,
+					vg_name_this,
+					display_size(cmd, (uint64_t) pv_pe_count(pv) * pv_pe_size(pv)),
+					display_size(cmd, (uint64_t) (pv_pe_count(pv) - pv_pe_alloc_count(pv)) * pv_pe_size(pv)));
 		return;
 	}
 
 	sprintf(vg_tmp_name, "%s", pv_vg_name(pv));
-	log_print("PV %-*s VG %-*s %s [%s / %s free]", pv_max_name_len,
-		  pv_tmp_name, vg_max_name_len, vg_tmp_name,
-		  pv->fmt ? pv->fmt->name : "    ",
-		  display_size(cmd, (uint64_t) pv_pe_count(pv) *
-					       pv_pe_size(pv)),
-		  display_size(cmd, (uint64_t) (pv_pe_count(pv) -
-						pv_pe_alloc_count(pv)) *
-					   pv_pe_size(pv)));
+	log_print_unless_silent("PV %-*s VG %-*s %s [%s / %s free]", pv_max_name_len,
+				pv_tmp_name, vg_max_name_len, vg_tmp_name,
+				pv->fmt ? pv->fmt->name : "    ",
+				display_size(cmd, (uint64_t) pv_pe_count(pv) * pv_pe_size(pv)),
+				display_size(cmd, (uint64_t) (pv_pe_count(pv) - pv_pe_alloc_count(pv)) * pv_pe_size(pv)));
 }
 
-int pvscan(struct cmd_context *cmd, int argc __attribute__((unused)),
-	   char **argv __attribute__((unused)))
+static int _auto_activation_handler(struct volume_group *vg, int partial,
+				    activation_change_t activate)
+{
+	/* TODO: add support for partial and clustered VGs */
+	if (partial || vg_is_clustered(vg))
+		return 1;
+
+	if (!vgchange_activate(vg->cmd, vg, activate)) {
+		log_error("%s: autoactivation failed.", vg->name);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int _pvscan_lvmetad(struct cmd_context *cmd, int argc, char **argv)
+{
+	int ret = ECMD_PROCESSED;
+	struct device *dev;
+	const char *pv_name;
+	int32_t major = -1;
+	int32_t minor = -1;
+	int devno_args = 0;
+	struct arg_value_group_list *current_group;
+	dev_t devno;
+	char *buf;
+	activation_handler handler = NULL;
+
+	if (arg_count(cmd, activate_ARG)) {
+		if (arg_uint_value(cmd, activate_ARG, CHANGE_AAY) != CHANGE_AAY) {
+			log_error("Only --activate ay allowed with pvscan.");
+			return 0;
+		}
+		handler = _auto_activation_handler;
+	}
+
+	if (arg_count(cmd, major_ARG) + arg_count(cmd, minor_ARG))
+		devno_args = 1;
+
+	if (devno_args && (!arg_count(cmd, major_ARG) || !arg_count(cmd, minor_ARG))) {
+		log_error("Both --major and --minor required to identify devices.");
+		return EINVALID_CMD_LINE;
+	}
+	
+	if (!lock_vol(cmd, VG_GLOBAL, LCK_VG_READ)) {
+		log_error("Unable to obtain global lock.");
+		return ECMD_FAILED;
+	}
+
+	/* Scan everything? */
+	if (!argc && !devno_args) {
+		if (!lvmetad_pvscan_all_devs(cmd, handler))
+			ret = ECMD_FAILED;
+		goto out;
+	}
+
+	log_verbose("Using physical volume(s) on command line");
+
+	/* Process any command line PVs first. */
+	while (argc--) {
+		pv_name = *argv++;
+		dev = dev_cache_get(pv_name, NULL);
+		if (!dev) {
+			log_error("Physical Volume %s not found.", pv_name);
+			ret = ECMD_FAILED;
+			continue;
+		}
+
+		if (!lvmetad_pvscan_single(cmd, dev, handler)) {
+			ret = ECMD_FAILED;
+			break;
+		}
+		if (sigint_caught())
+			break;
+	}
+
+	if (!devno_args)
+		goto out;
+
+	/* Process any grouped --major --minor args */
+	dm_list_iterate_items(current_group, &cmd->arg_value_groups) {
+		major = grouped_arg_int_value(current_group->arg_values, major_ARG, major);
+		minor = grouped_arg_int_value(current_group->arg_values, minor_ARG, minor);
+
+		if (major < 0 || minor < 0)
+			continue;
+
+		devno = MKDEV((dev_t)major, minor);
+
+		if (!(dev = dev_cache_get_by_devt(devno, NULL))) {
+			if (!dm_asprintf(&buf, "%" PRIi32 ":%" PRIi32, major, minor))
+				stack;
+			/* FIXME Filters? */
+			if (!lvmetad_pv_gone(devno, buf ? : "", handler)) {
+				ret = ECMD_FAILED;
+				if (buf)
+					dm_free(buf);
+				break;
+			}
+
+			log_print_unless_silent("Device %s not found. "
+						"Cleared from lvmetad cache.", buf ? : "");
+			if (buf)
+				dm_free(buf);
+			continue;
+		}
+
+		if (!lvmetad_pvscan_single(cmd, dev, handler)) {
+			ret = ECMD_FAILED;
+			break;
+		}
+
+		if (sigint_caught())
+			break;
+	}
+
+out:
+	unlock_vg(cmd, VG_GLOBAL);
+
+	return ret;
+}
+
+int pvscan(struct cmd_context *cmd, int argc, char **argv)
 {
 	int new_pvs_found = 0;
 	int pvs_found = 0;
@@ -112,6 +228,19 @@ int pvscan(struct cmd_context *cmd, int argc __attribute__((unused)),
 	int len = 0;
 	pv_max_name_len = 0;
 	vg_max_name_len = 0;
+
+	if (arg_count(cmd, cache_ARG))
+		return _pvscan_lvmetad(cmd, argc, argv);
+
+	if (arg_count(cmd, activate_ARG)) {
+		log_error("--activate is only valid with --cache.");
+		return EINVALID_CMD_LINE;
+	}
+
+	if (arg_count(cmd, major_ARG) + arg_count(cmd, minor_ARG)) {
+		log_error("--major and --minor are only valid with --cache.");
+		return EINVALID_CMD_LINE;
+	}
 
 	if (arg_count(cmd, novolumegroup_ARG) && arg_count(cmd, exported_ARG)) {
 		log_error("Options -e and -n are incompatible");
@@ -128,8 +257,13 @@ int pvscan(struct cmd_context *cmd, int argc __attribute__((unused)),
 		return ECMD_FAILED;
 	}
 
-	persistent_filter_wipe(cmd->filter);
+	if (cmd->filter->wipe)
+		cmd->filter->wipe(cmd->filter);
 	lvmcache_destroy(cmd, 1);
+
+	/* populate lvmcache */
+	if (!lvmetad_vg_list_to_lvmcache(cmd))
+		stack;
 
 	log_verbose("Walking through all physical volumes");
 	if (!(pvslist = get_pvs(cmd))) {
@@ -143,9 +277,10 @@ int pvscan(struct cmd_context *cmd, int argc __attribute__((unused)),
 		pv = pvl->pv;
 
 		if ((arg_count(cmd, exported_ARG)
-		     && !(pv_status(pv) & EXPORTED_VG))
-		    || (arg_count(cmd, novolumegroup_ARG) && (!is_orphan(pv)))) {
+		     && !(pv_status(pv) & EXPORTED_VG)) ||
+		    (arg_count(cmd, novolumegroup_ARG) && (!is_orphan(pv)))) {
 			dm_list_del(&pvl->list);
+			free_pv_fid(pv);
 			continue;
 		}
 
@@ -183,21 +318,23 @@ int pvscan(struct cmd_context *cmd, int argc __attribute__((unused)),
 	pv_max_name_len += 2;
 	vg_max_name_len += 2;
 
-	dm_list_iterate_items(pvl, pvslist)
-	    _pvscan_display_single(cmd, pvl->pv, NULL);
+	dm_list_iterate_items(pvl, pvslist) {
+		_pvscan_display_single(cmd, pvl->pv, NULL);
+		free_pv_fid(pvl->pv);
+	}
 
 	if (!pvs_found) {
-		log_print("No matching physical volumes found");
+		log_print_unless_silent("No matching physical volumes found");
 		unlock_vg(cmd, VG_GLOBAL);
 		return ECMD_PROCESSED;
 	}
 
-	log_print("Total: %d [%s] / in use: %d [%s] / in no VG: %d [%s]",
-		  pvs_found,
-		  display_size(cmd, size_total),
-		  pvs_found - new_pvs_found,
-		  display_size(cmd, (size_total - size_new)),
-		  new_pvs_found, display_size(cmd, size_new));
+	log_print_unless_silent("Total: %d [%s] / in use: %d [%s] / in no VG: %d [%s]",
+				pvs_found,
+				display_size(cmd, size_total),
+				pvs_found - new_pvs_found,
+				display_size(cmd, (size_total - size_new)),
+				new_pvs_found, display_size(cmd, size_new));
 
 	unlock_vg(cmd, VG_GLOBAL);
 

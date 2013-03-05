@@ -32,7 +32,7 @@ static int _pvdisplay_single(struct cmd_context *cmd,
 		vg = vg_read(cmd, vg_name, (char *)&pv->vgid, 0);
 		if (vg_read_error(vg)) {
 			log_error("Skipping volume group %s", vg_name);
-			free_vg(vg);
+			release_vg(vg);
 			/* FIXME If CLUSTERED should return ECMD_PROCESSED here */
 			return ECMD_FAILED;
 		}
@@ -54,7 +54,7 @@ static int _pvdisplay_single(struct cmd_context *cmd,
 	if (is_orphan(pv))
 		size = pv_size(pv);
 	else
-		size = (pv_pe_count(pv) - pv_pe_alloc_count(pv)) *
+		size = (uint64_t)(pv_pe_count(pv) - pv_pe_alloc_count(pv)) *
 			pv_pe_size(pv);
 
 	if (arg_count(cmd, short_ARG)) {
@@ -85,7 +85,7 @@ out:
 	if (vg_name)
 		unlock_vg(cmd, vg_name);
 	if (!old_vg)
-		free_vg(vg);
+		release_vg(vg);
 
 	return ret;
 }

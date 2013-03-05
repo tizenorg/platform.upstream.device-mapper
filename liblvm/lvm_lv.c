@@ -62,7 +62,7 @@ struct lvm_property_value lvm_lvseg_get_property(const lvseg_t lvseg,
 uint64_t lvm_lv_is_active(const lv_t lv)
 {
 	struct lvinfo info;
-	if (lv_info(lv->vg->cmd, lv, 0, &info, 1, 0) &&
+	if (lv_info(lv->vg->cmd, lv, 0, &info, 0, 0) &&
 	    info.exists && info.live_table)
 		return 1;
 	return 0;
@@ -71,7 +71,7 @@ uint64_t lvm_lv_is_active(const lv_t lv)
 uint64_t lvm_lv_is_suspended(const lv_t lv)
 {
 	struct lvinfo info;
-	if (lv_info(lv->vg->cmd, lv, 0, &info, 1, 0) &&
+	if (lv_info(lv->vg->cmd, lv, 0, &info, 0, 0) &&
 	    info.exists && info.suspended)
 		return 1;
 	return 0;
@@ -110,7 +110,7 @@ static void _lv_set_default_params(struct lvcreate_params *lp,
 	lp->zero = 1;
 	lp->major = -1;
 	lp->minor = -1;
-	lp->activation_monitoring = DEFAULT_DMEVENTD_MONITOR;
+	lp->activate = CHANGE_AY;
 	lp->vg_name = vg->name;
 	lp->lv_name = lvname; /* FIXME: check this for safety */
 	lp->pvh = &vg->pvs;
@@ -123,12 +123,18 @@ static void _lv_set_default_params(struct lvcreate_params *lp,
 }
 
 /* Set default for linear segment specific LV parameters */
-static void _lv_set_default_linear_params(struct cmd_context *cmd,
+static int _lv_set_default_linear_params(struct cmd_context *cmd,
 					  struct lvcreate_params *lp)
 {
-	lp->segtype = get_segtype_from_string(cmd, "striped");
+	if (!(lp->segtype = get_segtype_from_string(cmd, "striped"))) {
+		log_error(INTERNAL_ERROR "Segtype striped not found.");
+		return 0;
+	}
+
 	lp->stripes = 1;
 	lp->stripe_size = DEFAULT_STRIPESIZE * 2;
+
+	return 1;
 }
 
 /*
@@ -138,7 +144,7 @@ static void _lv_set_default_linear_params(struct cmd_context *cmd,
  */
 lv_t lvm_vg_create_lv_linear(vg_t vg, const char *name, uint64_t size)
 {
-	struct lvcreate_params lp;
+	struct lvcreate_params lp = { 0 };
 	uint64_t extents;
 	struct lv_list *lvl;
 
@@ -146,15 +152,19 @@ lv_t lvm_vg_create_lv_linear(vg_t vg, const char *name, uint64_t size)
 		return NULL;
 	if (!vg_check_write_mode(vg))
 		return NULL;
-	memset(&lp, 0, sizeof(lp));
-	extents = extents_from_size(vg->cmd, size / SECTOR_SIZE,
-				    vg->extent_size);
-	_lv_set_default_params(&lp, vg, name, extents);
-	_lv_set_default_linear_params(vg->cmd, &lp);
-	if (!lv_create_single(vg, &lp))
+
+	if (!(extents = extents_from_size(vg->cmd, size / SECTOR_SIZE,
+					  vg->extent_size))) {
+		log_error("Unable to create LV without size.");
 		return NULL;
-	lvl = find_lv_in_vg(vg, name);
-	if (!lvl)
+	}
+
+	_lv_set_default_params(&lp, vg, name, extents);
+	if (!_lv_set_default_linear_params(vg->cmd, &lp))
+		return_NULL;
+	if (!lv_create_single(vg, &lp))
+		return_NULL;
+	if (!(lvl = find_lv_in_vg(vg, name)))
 		return NULL;
 	return (lv_t) lvl->lv;
 }
@@ -269,12 +279,12 @@ lv_t lvm_lv_from_uuid(vg_t vg, const char *uuid)
 		log_errno (EINVAL, "Invalid UUID string length");
 		return NULL;
 	}
-	if (strlen(uuid) >= ID_LEN) {
-		if (!id_read_format(&id, uuid)) {
-			log_errno(EINVAL, "Invalid UUID format");
-			return NULL;
-		}
+
+	if (!id_read_format(&id, uuid)) {
+		log_errno(EINVAL, "Invalid UUID format.");
+		return NULL;
 	}
+
 	dm_list_iterate_items(lvl, &vg->lvs) {
 		if (id_equal(&vg->id, &lvl->lv->lvid.id[0]) &&
 		    id_equal(&id, &lvl->lv->lvid.id[1]))
@@ -282,6 +292,16 @@ lv_t lvm_lv_from_uuid(vg_t vg, const char *uuid)
 	}
 	return NULL;
 }
+
+int lvm_lv_rename(lv_t lv, const char *new_name)
+{
+	if (!lv_rename(lv->vg->cmd, lv, new_name)) {
+		log_verbose("LV Rename failed.");
+		return -1;
+	}
+	return 0;
+}
+
 int lvm_lv_resize(const lv_t lv, uint64_t new_size)
 {
 	/* FIXME: add lv resize code here */

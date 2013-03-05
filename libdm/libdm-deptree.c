@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2005-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of the device-mapper userspace tools.
  *
@@ -16,16 +16,12 @@
 #include "libdm-targets.h"
 #include "libdm-common.h"
 #include "kdev_t.h"
-#include "dm-ioctl.h"
 
 #include <stdarg.h>
 #include <sys/param.h>
 #include <sys/utsname.h>
 
 #define MAX_TARGET_PARAMSIZE 500000
-
-/* FIXME Fix interface so this is used only by LVM */
-#define UUID_PREFIX "LVM-"
 
 #define REPLICATOR_LOCAL_SITE 0
 
@@ -42,6 +38,19 @@ enum {
 	SEG_SNAPSHOT_MERGE,
 	SEG_STRIPED,
 	SEG_ZERO,
+	SEG_THIN_POOL,
+	SEG_THIN,
+	SEG_RAID1,
+	SEG_RAID10,
+	SEG_RAID4,
+	SEG_RAID5_LA,
+	SEG_RAID5_RA,
+	SEG_RAID5_LS,
+	SEG_RAID5_RS,
+	SEG_RAID6_ZR,
+	SEG_RAID6_NR,
+	SEG_RAID6_NC,
+	SEG_LAST,
 };
 
 /* FIXME Add crypt and multipath support */
@@ -61,6 +70,26 @@ struct {
 	{ SEG_SNAPSHOT_MERGE, "snapshot-merge" },
 	{ SEG_STRIPED, "striped" },
 	{ SEG_ZERO, "zero"},
+	{ SEG_THIN_POOL, "thin-pool"},
+	{ SEG_THIN, "thin"},
+	{ SEG_RAID1, "raid1"},
+	{ SEG_RAID10, "raid10"},
+	{ SEG_RAID4, "raid4"},
+	{ SEG_RAID5_LA, "raid5_la"},
+	{ SEG_RAID5_RA, "raid5_ra"},
+	{ SEG_RAID5_LS, "raid5_ls"},
+	{ SEG_RAID5_RS, "raid5_rs"},
+	{ SEG_RAID6_ZR, "raid6_zr"},
+	{ SEG_RAID6_NR, "raid6_nr"},
+	{ SEG_RAID6_NC, "raid6_nc"},
+
+	/*
+	 *WARNING: Since 'raid' target overloads this 1:1 mapping table
+	 * for search do not add new enum elements past them!
+	 */
+	{ SEG_RAID5_LS, "raid5"}, /* same as "raid5_ls" (default for MD also) */
+	{ SEG_RAID6_ZR, "raid6"}, /* same as "raid6_zr" */
+	{ SEG_LAST, NULL },
 };
 
 /* Some segment types have a list of areas of other devices attached */
@@ -75,6 +104,32 @@ struct seg_area {
 	struct dm_tree_node *slog;	/* Replicator sync log node */
 	uint64_t region_size;		/* Replicator sync log size */
 	uint32_t flags;			/* Replicator sync log flags */
+};
+
+struct dm_thin_message {
+	dm_thin_message_t type;
+	union {
+		struct {
+			uint32_t device_id;
+			uint32_t origin_id;
+		} m_create_snap;
+		struct {
+			uint32_t device_id;
+		} m_create_thin;
+		struct {
+			uint32_t device_id;
+		} m_delete;
+		struct {
+			uint64_t current_id;
+			uint64_t new_id;
+		} m_set_transaction_id;
+	} u;
+};
+
+struct thin_message {
+	struct dm_list list;
+	struct dm_thin_message message;
+	int expected_errno;
 };
 
 /* Replicator-log has a list of sites */
@@ -100,7 +155,7 @@ struct load_segment {
 	unsigned area_count;		/* Linear + Striped + Mirrored + Crypt + Replicator */
 	struct dm_list areas;		/* Linear + Striped + Mirrored + Crypt + Replicator */
 
-	uint32_t stripe_size;		/* Striped */
+	uint32_t stripe_size;		/* Striped + raid */
 
 	int persistent;			/* Snapshot */
 	uint32_t chunk_size;		/* Snapshot */
@@ -109,7 +164,7 @@ struct load_segment {
 	struct dm_tree_node *merge;	/* Snapshot */
 
 	struct dm_tree_node *log;	/* Mirror + Replicator */
-	uint32_t region_size;		/* Mirror */
+	uint32_t region_size;		/* Mirror + raid */
 	unsigned clustered;		/* Mirror */
 	unsigned mirror_area_count;	/* Mirror */
 	uint32_t flags;			/* Mirror log */
@@ -127,6 +182,21 @@ struct load_segment {
 	unsigned rdevice_count;		/* Replicator */
 	struct dm_tree_node *replicator;/* Replicator-dev */
 	uint64_t rdevice_index;		/* Replicator-dev */
+
+	uint64_t rebuilds;	      /* raid */
+
+	struct dm_tree_node *metadata;	/* Thin_pool */
+	struct dm_tree_node *pool;	/* Thin_pool, Thin */
+	struct dm_tree_node *external;	/* Thin */
+	struct dm_list thin_messages;	/* Thin_pool */
+	uint64_t transaction_id;	/* Thin_pool */
+	uint64_t low_water_mark;	/* Thin_pool */
+	uint32_t data_block_size;       /* Thin_pool */
+	unsigned skip_block_zeroing;	/* Thin_pool */
+	unsigned ignore_discard;	/* Thin_pool target vsn 1.1 */
+	unsigned no_discard_passdown;	/* Thin_pool target vsn 1.1 */
+	uint32_t device_id;		/* Thin */
+
 };
 
 /* Per-device properties */
@@ -149,7 +219,19 @@ struct load_properties {
 	 * and processing of dm tree). This will also flush all stacked dev
 	 * node operations, synchronizing with udev.
 	 */
-	int immediate_dev_node;
+	unsigned immediate_dev_node;
+
+	/*
+	 * If the device size changed from zero and this is set,
+	 * don't resume the device immediately, even if the device
+	 * has parents.  This works provided the parents do not
+	 * validate the device size and is required by pvmove to
+	 * avoid starting the mirror resync operation too early.
+	 */
+	unsigned delay_resume_if_new;
+
+	/* Send messages for this node in preload */
+	unsigned send_messages;
 };
 
 /* Two of these used to join two nodes with uses and used_by. */
@@ -161,12 +243,12 @@ struct dm_tree_link {
 struct dm_tree_node {
 	struct dm_tree *dtree;
 
-        const char *name;
-        const char *uuid;
-        struct dm_info info;
+	const char *name;
+	const char *uuid;
+	struct dm_info info;
 
-        struct dm_list uses;       	/* Nodes this node uses */
-        struct dm_list used_by;    	/* Nodes that use this node */
+	struct dm_list uses;       	/* Nodes this node uses */
+	struct dm_list used_by;    	/* Nodes that use this node */
 
 	int activation_priority;	/* 0 gets activated first */
 
@@ -181,6 +263,10 @@ struct dm_tree_node {
 	 * Note: only direct child is allowed
 	 */
 	struct dm_tree_node *presuspend_node;
+
+	/* Callback */
+	dm_node_callback_fn callback;
+	void *callback_data;
 };
 
 struct dm_tree {
@@ -189,16 +275,24 @@ struct dm_tree {
 	struct dm_hash_table *uuids;
 	struct dm_tree_node root;
 	int skip_lockfs;		/* 1 skips lockfs (for non-snapshots) */
-	int no_flush;		/* 1 sets noflush (mirrors/multipath) */
+	int no_flush;			/* 1 sets noflush (mirrors/multipath) */
+	int retry_remove;		/* 1 retries remove if not successful */
 	uint32_t cookie;
 };
 
+/*
+ * Tree functions.
+ */
 struct dm_tree *dm_tree_create(void)
 {
+	struct dm_pool *dmem;
 	struct dm_tree *dtree;
 
-	if (!(dtree = dm_zalloc(sizeof(*dtree)))) {
-		log_error("dm_tree_create malloc failed");
+	if (!(dmem = dm_pool_create("dtree", 1024)) ||
+	    !(dtree = dm_pool_zalloc(dmem, sizeof(*dtree)))) {
+		log_error("Failed to allocate dtree.");
+		if (dmem)
+			dm_pool_destroy(dmem);
 		return NULL;
 	}
 
@@ -207,17 +301,11 @@ struct dm_tree *dm_tree_create(void)
 	dm_list_init(&dtree->root.used_by);
 	dtree->skip_lockfs = 0;
 	dtree->no_flush = 0;
-
-	if (!(dtree->mem = dm_pool_create("dtree", 1024))) {
-		log_error("dtree pool creation failed");
-		dm_free(dtree);
-		return NULL;
-	}
+	dtree->mem = dmem;
 
 	if (!(dtree->devs = dm_hash_create(8))) {
 		log_error("dtree hash creation failed");
 		dm_pool_destroy(dtree->mem);
-		dm_free(dtree);
 		return NULL;
 	}
 
@@ -225,7 +313,6 @@ struct dm_tree *dm_tree_create(void)
 		log_error("dtree uuid hash creation failed");
 		dm_hash_destroy(dtree->devs);
 		dm_pool_destroy(dtree->mem);
-		dm_free(dtree);
 		return NULL;
 	}
 
@@ -240,9 +327,36 @@ void dm_tree_free(struct dm_tree *dtree)
 	dm_hash_destroy(dtree->uuids);
 	dm_hash_destroy(dtree->devs);
 	dm_pool_destroy(dtree->mem);
-	dm_free(dtree);
 }
 
+void dm_tree_set_cookie(struct dm_tree_node *node, uint32_t cookie)
+{
+	node->dtree->cookie = cookie;
+}
+
+uint32_t dm_tree_get_cookie(struct dm_tree_node *node)
+{
+	return node->dtree->cookie;
+}
+
+void dm_tree_skip_lockfs(struct dm_tree_node *dnode)
+{
+	dnode->dtree->skip_lockfs = 1;
+}
+
+void dm_tree_use_no_flush_suspend(struct dm_tree_node *dnode)
+{
+	dnode->dtree->no_flush = 1;
+}
+
+void dm_tree_retry_remove(struct dm_tree_node *dnode)
+{
+	dnode->dtree->retry_remove = 1;
+}
+
+/*
+ * Node functions.
+ */
 static int _nodes_are_linked(const struct dm_tree_node *parent,
 			     const struct dm_tree_node *child)
 {
@@ -329,13 +443,13 @@ static void _remove_from_bottomlevel(struct dm_tree_node *node)
 static int _link_tree_nodes(struct dm_tree_node *parent, struct dm_tree_node *child)
 {
 	/* Don't link to root node if child already has a parent */
-	if ((parent == &parent->dtree->root)) {
+	if (parent == &parent->dtree->root) {
 		if (dm_tree_node_num_children(child, 1))
 			return 1;
 	} else
 		_remove_from_toplevel(child);
 
-	if ((child == &child->dtree->root)) {
+	if (child == &child->dtree->root) {
 		if (dm_tree_node_num_children(parent, 0))
 			return 1;
 	} else
@@ -352,7 +466,7 @@ static struct dm_tree_node *_create_dm_tree_node(struct dm_tree *dtree,
 						 uint16_t udev_flags)
 {
 	struct dm_tree_node *node;
-	uint64_t dev;
+	dev_t dev;
 
 	if (!(node = dm_pool_zalloc(dtree->mem, sizeof(*node)))) {
 		log_error("_create_dm_tree_node alloc failed");
@@ -372,7 +486,7 @@ static struct dm_tree_node *_create_dm_tree_node(struct dm_tree *dtree,
 	dm_list_init(&node->used_by);
 	dm_list_init(&node->props.segs);
 
-	dev = MKDEV(info->major, info->minor);
+	dev = MKDEV((dev_t)info->major, info->minor);
 
 	if (!dm_hash_insert_binary(dtree->devs, (const char *) &dev,
 				sizeof(dev), node)) {
@@ -396,7 +510,7 @@ static struct dm_tree_node *_create_dm_tree_node(struct dm_tree *dtree,
 static struct dm_tree_node *_find_dm_tree_node(struct dm_tree *dtree,
 					       uint32_t major, uint32_t minor)
 {
-	uint64_t dev = MKDEV(major, minor);
+	dev_t dev = MKDEV((dev_t)major, minor);
 
 	return dm_hash_lookup_binary(dtree->devs, (const char *) &dev,
 				  sizeof(dev));
@@ -406,286 +520,33 @@ static struct dm_tree_node *_find_dm_tree_node_by_uuid(struct dm_tree *dtree,
 						       const char *uuid)
 {
 	struct dm_tree_node *node;
+	const char *default_uuid_prefix;
+	size_t default_uuid_prefix_len;
 
 	if ((node = dm_hash_lookup(dtree->uuids, uuid)))
 		return node;
 
-	if (strncmp(uuid, UUID_PREFIX, sizeof(UUID_PREFIX) - 1))
+	default_uuid_prefix = dm_uuid_prefix();
+	default_uuid_prefix_len = strlen(default_uuid_prefix);
+
+	if (strncmp(uuid, default_uuid_prefix, default_uuid_prefix_len))
 		return NULL;
 
-	return dm_hash_lookup(dtree->uuids, uuid + sizeof(UUID_PREFIX) - 1);
+	return dm_hash_lookup(dtree->uuids, uuid + default_uuid_prefix_len);
 }
 
-static int _deps(struct dm_task **dmt, struct dm_pool *mem, uint32_t major, uint32_t minor,
-		 const char **name, const char **uuid,
-		 struct dm_info *info, struct dm_deps **deps)
+void dm_tree_node_set_udev_flags(struct dm_tree_node *dnode, uint16_t udev_flags)
+
 {
-	memset(info, 0, sizeof(*info));
+	struct dm_info *dinfo = &dnode->info;
 
-	if (!dm_is_dm_major(major)) {
-		*name = "";
-		*uuid = "";
-		*deps = NULL;
-		info->major = major;
-		info->minor = minor;
-		info->exists = 0;
-		info->live_table = 0;
-		info->inactive_table = 0;
-		info->read_only = 0;
-		return 1;
-	}
-
-	if (!(*dmt = dm_task_create(DM_DEVICE_DEPS))) {
-		log_error("deps dm_task creation failed");
-		return 0;
-	}
-
-	if (!dm_task_set_major(*dmt, major)) {
-		log_error("_deps: failed to set major for (%" PRIu32 ":%" PRIu32 ")",
-			  major, minor);
-		goto failed;
-	}
-
-	if (!dm_task_set_minor(*dmt, minor)) {
-		log_error("_deps: failed to set minor for (%" PRIu32 ":%" PRIu32 ")",
-			  major, minor);
-		goto failed;
-	}
-
-	if (!dm_task_run(*dmt)) {
-		log_error("_deps: task run failed for (%" PRIu32 ":%" PRIu32 ")",
-			  major, minor);
-		goto failed;
-	}
-
-	if (!dm_task_get_info(*dmt, info)) {
-		log_error("_deps: failed to get info for (%" PRIu32 ":%" PRIu32 ")",
-			  major, minor);
-		goto failed;
-	}
-
-	if (!info->exists) {
-		*name = "";
-		*uuid = "";
-		*deps = NULL;
-	} else {
-		if (info->major != major) {
-			log_error("Inconsistent dtree major number: %u != %u",
-				  major, info->major);
-			goto failed;
-		}
-		if (info->minor != minor) {
-			log_error("Inconsistent dtree minor number: %u != %u",
-				  minor, info->minor);
-			goto failed;
-		}
-		if (!(*name = dm_pool_strdup(mem, dm_task_get_name(*dmt)))) {
-			log_error("name pool_strdup failed");
-			goto failed;
-		}
-		if (!(*uuid = dm_pool_strdup(mem, dm_task_get_uuid(*dmt)))) {
-			log_error("uuid pool_strdup failed");
-			goto failed;
-		}
-		*deps = dm_task_get_deps(*dmt);
-	}
-
-	return 1;
-
-failed:
-	dm_task_destroy(*dmt);
-	return 0;
+	if (udev_flags != dnode->udev_flags)
+		log_debug("Resetting %s (%" PRIu32 ":%" PRIu32
+			  ") udev_flags from 0x%x to 0x%x",
+			  dnode->name, dinfo->major, dinfo->minor,
+			  dnode->udev_flags, udev_flags);
+	dnode->udev_flags = udev_flags;
 }
-
-static struct dm_tree_node *_add_dev(struct dm_tree *dtree,
-				     struct dm_tree_node *parent,
-				     uint32_t major, uint32_t minor,
-				     uint16_t udev_flags)
-{
-	struct dm_task *dmt = NULL;
-	struct dm_info info;
-	struct dm_deps *deps = NULL;
-	const char *name = NULL;
-	const char *uuid = NULL;
-	struct dm_tree_node *node = NULL;
-	uint32_t i;
-	int new = 0;
-
-	/* Already in tree? */
-	if (!(node = _find_dm_tree_node(dtree, major, minor))) {
-		if (!_deps(&dmt, dtree->mem, major, minor, &name, &uuid, &info, &deps))
-			return_NULL;
-
-		if (!(node = _create_dm_tree_node(dtree, name, uuid, &info,
-						  NULL, udev_flags)))
-			goto_out;
-		new = 1;
-	}
-
-	if (!_link_tree_nodes(parent, node)) {
-		node = NULL;
-		goto_out;
-	}
-
-	/* If node was already in tree, no need to recurse. */
-	if (!new)
-		goto out;
-
-	/* Can't recurse if not a mapped device or there are no dependencies */
-	if (!node->info.exists || !deps->count) {
-		if (!_add_to_bottomlevel(node)) {
-			stack;
-			node = NULL;
-		}
-		goto out;
-	}
-
-	/* Add dependencies to tree */
-	for (i = 0; i < deps->count; i++)
-		if (!_add_dev(dtree, node, MAJOR(deps->device[i]),
-			      MINOR(deps->device[i]), udev_flags)) {
-			node = NULL;
-			goto_out;
-		}
-
-out:
-	if (dmt)
-		dm_task_destroy(dmt);
-
-	return node;
-}
-
-static int _node_clear_table(struct dm_tree_node *dnode)
-{
-	struct dm_task *dmt;
-	struct dm_info *info;
-	const char *name;
-	int r;
-
-	if (!(info = &dnode->info)) {
-		log_error("_node_clear_table failed: missing info");
-		return 0;
-	}
-
-	if (!(name = dm_tree_node_get_name(dnode))) {
-		log_error("_node_clear_table failed: missing name");
-		return 0;
-	}
-
-	/* Is there a table? */
-	if (!info->exists || !info->inactive_table)
-		return 1;
-
-	log_verbose("Clearing inactive table %s (%" PRIu32 ":%" PRIu32 ")",
-		    name, info->major, info->minor);
-
-	if (!(dmt = dm_task_create(DM_DEVICE_CLEAR))) {
-		log_error("Table clear dm_task creation failed for %s", name);
-		return 0;
-	}
-
-	if (!dm_task_set_major(dmt, info->major) ||
-	    !dm_task_set_minor(dmt, info->minor)) {
-		log_error("Failed to set device number for %s table clear", name);
-		dm_task_destroy(dmt);
-		return 0;
-	}
-
-	r = dm_task_run(dmt);
-
-	if (!dm_task_get_info(dmt, info)) {
-		log_error("_node_clear_table failed: info missing after running task for %s", name);
-		r = 0;
-	}
-
-	dm_task_destroy(dmt);
-
-	return r;
-}
-
-struct dm_tree_node *dm_tree_add_new_dev(struct dm_tree *dtree,
-					    const char *name,
-					    const char *uuid,
-					    uint32_t major, uint32_t minor,
-					    int read_only,
-					    int clear_inactive,
-					    void *context)
-{
-	struct dm_tree_node *dnode;
-	struct dm_info info;
-	const char *name2;
-	const char *uuid2;
-
-	/* Do we need to add node to tree? */
-	if (!(dnode = dm_tree_find_node_by_uuid(dtree, uuid))) {
-		if (!(name2 = dm_pool_strdup(dtree->mem, name))) {
-			log_error("name pool_strdup failed");
-			return NULL;
-		}
-		if (!(uuid2 = dm_pool_strdup(dtree->mem, uuid))) {
-			log_error("uuid pool_strdup failed");
-			return NULL;
-		}
-
-		info.major = 0;
-		info.minor = 0;
-		info.exists = 0;
-		info.live_table = 0;
-		info.inactive_table = 0;
-		info.read_only = 0;
-
-		if (!(dnode = _create_dm_tree_node(dtree, name2, uuid2, &info,
-						   context, 0)))
-			return_NULL;
-
-		/* Attach to root node until a table is supplied */
-		if (!_add_to_toplevel(dnode) || !_add_to_bottomlevel(dnode))
-			return_NULL;
-
-		dnode->props.major = major;
-		dnode->props.minor = minor;
-		dnode->props.new_name = NULL;
-		dnode->props.size_changed = 0;
-	} else if (strcmp(name, dnode->name)) {
-		/* Do we need to rename node? */
-		if (!(dnode->props.new_name = dm_pool_strdup(dtree->mem, name))) {
-			log_error("name pool_strdup failed");
-			return 0;
-		}
-	}
-
-	dnode->props.read_only = read_only ? 1 : 0;
-	dnode->props.read_ahead = DM_READ_AHEAD_AUTO;
-	dnode->props.read_ahead_flags = 0;
-
-	if (clear_inactive && !_node_clear_table(dnode))
-		return_NULL;
-
-	dnode->context = context;
-	dnode->udev_flags = 0;
-
-	return dnode;
-}
-
-struct dm_tree_node *dm_tree_add_new_dev_with_udev_flags(struct dm_tree *dtree,
-							 const char *name,
-							 const char *uuid,
-							 uint32_t major,
-							 uint32_t minor,
-							 int read_only,
-							 int clear_inactive,
-							 void *context,
-							 uint16_t udev_flags)
-{
-	struct dm_tree_node *node;
-
-	if ((node = dm_tree_add_new_dev(dtree, name, uuid, major, minor, read_only,
-				       clear_inactive, context)))
-		node->udev_flags = udev_flags;
-
-	return node;
-}
-
 
 void dm_tree_node_set_read_ahead(struct dm_tree_node *dnode,
 				 uint32_t read_ahead,
@@ -699,17 +560,6 @@ void dm_tree_node_set_presuspend_node(struct dm_tree_node *node,
 				      struct dm_tree_node *presuspend_node)
 {
 	node->presuspend_node = presuspend_node;
-}
-
-int dm_tree_add_dev(struct dm_tree *dtree, uint32_t major, uint32_t minor)
-{
-	return _add_dev(dtree, &dtree->root, major, minor, 0) ? 1 : 0;
-}
-
-int dm_tree_add_dev_with_udev_flags(struct dm_tree *dtree, uint32_t major,
-				    uint32_t minor, uint16_t udev_flags)
-{
-	return _add_dev(dtree, &dtree->root, major, minor, udev_flags) ? 1 : 0;
 }
 
 const char *dm_tree_node_get_name(const struct dm_tree_node *node)
@@ -756,6 +606,9 @@ int dm_tree_node_num_children(const struct dm_tree_node *node, uint32_t inverted
  */
 static int _uuid_prefix_matches(const char *uuid, const char *uuid_prefix, size_t uuid_prefix_len)
 {
+	const char *default_uuid_prefix = dm_uuid_prefix();
+	size_t default_uuid_prefix_len = strlen(default_uuid_prefix);
+
 	if (!uuid_prefix)
 		return 1;
 
@@ -766,13 +619,13 @@ static int _uuid_prefix_matches(const char *uuid, const char *uuid_prefix, size_
 	if (uuid_prefix_len <= 4)
 		return 0;
 
-	if (!strncmp(uuid, UUID_PREFIX, sizeof(UUID_PREFIX) - 1))
+	if (!strncmp(uuid, default_uuid_prefix, default_uuid_prefix_len))
 		return 0;
 
-	if (strncmp(uuid_prefix, UUID_PREFIX, sizeof(UUID_PREFIX) - 1))
+	if (strncmp(uuid_prefix, default_uuid_prefix, default_uuid_prefix_len))
 		return 0;
 
-	if (!strncmp(uuid, uuid_prefix + sizeof(UUID_PREFIX) - 1, uuid_prefix_len - (sizeof(UUID_PREFIX) - 1)))
+	if (!strncmp(uuid, uuid_prefix + default_uuid_prefix_len, uuid_prefix_len - default_uuid_prefix_len))
 		return 1;
 
 	return 0;
@@ -876,11 +729,99 @@ struct dm_tree_node *dm_tree_next_child(void **handle,
 	return (*dlink) ? dm_list_item(*dlink, struct dm_tree_link)->node : NULL;
 }
 
+static int _deps(struct dm_task **dmt, struct dm_pool *mem, uint32_t major, uint32_t minor,
+		 const char **name, const char **uuid, unsigned inactive_table,
+		 struct dm_info *info, struct dm_deps **deps)
+{
+	memset(info, 0, sizeof(*info));
+
+	if (!dm_is_dm_major(major)) {
+		if (name)
+			*name = "";
+		if (uuid)
+			*uuid = "";
+		*deps = NULL;
+		info->major = major;
+		info->minor = minor;
+		return 1;
+	}
+
+	if (!(*dmt = dm_task_create(DM_DEVICE_DEPS))) {
+		log_error("deps dm_task creation failed");
+		return 0;
+	}
+
+	if (!dm_task_set_major(*dmt, major)) {
+		log_error("_deps: failed to set major for (%" PRIu32 ":%" PRIu32 ")",
+			  major, minor);
+		goto failed;
+	}
+
+	if (!dm_task_set_minor(*dmt, minor)) {
+		log_error("_deps: failed to set minor for (%" PRIu32 ":%" PRIu32 ")",
+			  major, minor);
+		goto failed;
+	}
+
+	if (inactive_table && !dm_task_query_inactive_table(*dmt)) {
+		log_error("_deps: failed to set inactive table for (%" PRIu32 ":%" PRIu32 ")",
+			  major, minor);
+		goto failed;
+	}
+
+	if (!dm_task_run(*dmt)) {
+		log_error("_deps: task run failed for (%" PRIu32 ":%" PRIu32 ")",
+			  major, minor);
+		goto failed;
+	}
+
+	if (!dm_task_get_info(*dmt, info)) {
+		log_error("_deps: failed to get info for (%" PRIu32 ":%" PRIu32 ")",
+			  major, minor);
+		goto failed;
+	}
+
+	if (!info->exists) {
+		if (name)
+			*name = "";
+		if (uuid)
+			*uuid = "";
+		*deps = NULL;
+	} else {
+		if (info->major != major) {
+			log_error("Inconsistent dtree major number: %u != %u",
+				  major, info->major);
+			goto failed;
+		}
+		if (info->minor != minor) {
+			log_error("Inconsistent dtree minor number: %u != %u",
+				  minor, info->minor);
+			goto failed;
+		}
+		if (name && !(*name = dm_pool_strdup(mem, dm_task_get_name(*dmt)))) {
+			log_error("name pool_strdup failed");
+			goto failed;
+		}
+		if (uuid && !(*uuid = dm_pool_strdup(mem, dm_task_get_uuid(*dmt)))) {
+			log_error("uuid pool_strdup failed");
+			goto failed;
+		}
+		*deps = dm_task_get_deps(*dmt);
+	}
+
+	return 1;
+
+failed:
+	dm_task_destroy(*dmt);
+	return 0;
+}
+
 /*
  * Deactivate a device with its dependencies if the uuid prefix matches.
  */
 static int _info_by_dev(uint32_t major, uint32_t minor, int with_open_count,
-			struct dm_info *info)
+			struct dm_info *info, struct dm_pool *mem,
+			const char **name, const char **uuid)
 {
 	struct dm_task *dmt;
 	int r;
@@ -899,12 +840,59 @@ static int _info_by_dev(uint32_t major, uint32_t minor, int with_open_count,
 	if (!with_open_count && !dm_task_no_open_count(dmt))
 		log_error("Failed to disable open_count");
 
-	if ((r = dm_task_run(dmt)))
-		r = dm_task_get_info(dmt, info);
+	if (!(r = dm_task_run(dmt)))
+		goto_out;
 
+	if (!(r = dm_task_get_info(dmt, info)))
+		goto_out;
+
+	if (name && !(*name = dm_pool_strdup(mem, dm_task_get_name(dmt)))) {
+		log_error("name pool_strdup failed");
+		r = 0;
+		goto_out;
+	}
+
+	if (uuid && !(*uuid = dm_pool_strdup(mem, dm_task_get_uuid(dmt)))) {
+		log_error("uuid pool_strdup failed");
+		r = 0;
+		goto_out;
+	}
+
+out:
 	dm_task_destroy(dmt);
 
 	return r;
+}
+
+static int _check_device_not_in_use(const char *name, struct dm_info *info)
+{
+	if (!info->exists)
+		return 1;
+
+	/* If sysfs is not used, use open_count information only. */
+	if (!*dm_sysfs_dir()) {
+		if (info->open_count) {
+			log_error("Device %s (%" PRIu32 ":%" PRIu32 ") in use",
+				  name, info->major, info->minor);
+			return 0;
+		}
+
+		return 1;
+	}
+
+	if (dm_device_has_holders(info->major, info->minor)) {
+		log_error("Device %s (%" PRIu32 ":%" PRIu32 ") is used "
+			  "by another device.", name, info->major, info->minor);
+		return 0;
+	}
+
+	if (dm_device_has_mounted_fs(info->major, info->minor)) {
+		log_error("Device %s (%" PRIu32 ":%" PRIu32 ") contains "
+			  "a filesystem in use.", name, info->major, info->minor);
+		return 0;
+	}
+
+	return 1;
 }
 
 /* Check if all parent nodes of given node have open_count == 0 */
@@ -934,19 +922,22 @@ static int _node_has_closed_parents(struct dm_tree_node *node,
 		}
 
 		/* Refresh open_count */
-		if (!_info_by_dev(dinfo->major, dinfo->minor, 1, &info) ||
+		if (!_info_by_dev(dinfo->major, dinfo->minor, 1, &info, NULL, NULL, NULL) ||
 		    !info.exists)
 			continue;
 
-		if (info.open_count)
+		if (info.open_count) {
+			log_debug("Node %s %d:%d has open_count %d", uuid_prefix,
+				  dinfo->major, dinfo->minor, info.open_count);
 			return 0;
+		}
 	}
 
 	return 1;
 }
 
 static int _deactivate_node(const char *name, uint32_t major, uint32_t minor,
-			    uint32_t *cookie, uint16_t udev_flags)
+			    uint32_t *cookie, uint16_t udev_flags, int retry)
 {
 	struct dm_task *dmt;
 	int r = 0;
@@ -966,14 +957,18 @@ static int _deactivate_node(const char *name, uint32_t major, uint32_t minor,
 	if (!dm_task_no_open_count(dmt))
 		log_error("Failed to disable open_count");
 
-	if (!dm_task_set_cookie(dmt, cookie, udev_flags))
-		goto out;
+	if (cookie)
+		if (!dm_task_set_cookie(dmt, cookie, udev_flags))
+			goto out;
+
+	if (retry)
+		dm_task_retry_remove(dmt);
 
 	r = dm_task_run(dmt);
 
-	/* FIXME Until kernel returns actual name so dm-ioctl.c can handle it */
-	rm_dev_node(name, dmt->cookie_set &&
-			  !(udev_flags & DM_UDEV_DISABLE_DM_RULES_FLAG));
+	/* FIXME Until kernel returns actual name so dm-iface.c can handle it */
+	rm_dev_node(name, dmt->cookie_set && !(udev_flags & DM_UDEV_DISABLE_DM_RULES_FLAG),
+		    dmt->cookie_set && (udev_flags & DM_UDEV_DISABLE_LIBRARY_FALLBACK));
 
 	/* FIXME Remove node from tree or mark invalid? */
 
@@ -981,6 +976,244 @@ out:
 	dm_task_destroy(dmt);
 
 	return r;
+}
+
+static int _node_clear_table(struct dm_tree_node *dnode, uint16_t udev_flags)
+{
+	struct dm_task *dmt = NULL, *deps_dmt = NULL;
+	struct dm_info *info, deps_info;
+	struct dm_deps *deps = NULL;
+	const char *name, *uuid;
+	const char *default_uuid_prefix;
+	size_t default_uuid_prefix_len;
+	uint32_t i;
+	int r = 0;
+
+	if (!(info = &dnode->info)) {
+		log_error("_node_clear_table failed: missing info");
+		return 0;
+	}
+
+	if (!(name = dm_tree_node_get_name(dnode))) {
+		log_error("_node_clear_table failed: missing name");
+		return 0;
+	}
+
+	/* Is there a table? */
+	if (!info->exists || !info->inactive_table)
+		return 1;
+
+	/* Get devices used by inactive table that's about to be deleted. */
+	if (!_deps(&deps_dmt, dnode->dtree->mem, info->major, info->minor, NULL, NULL, 1, info, &deps)) {
+		log_error("Failed to obtain dependencies for %s before clearing table.", name);
+		return 0;
+	}
+
+	log_verbose("Clearing inactive table %s (%" PRIu32 ":%" PRIu32 ")",
+		    name, info->major, info->minor);
+
+	if (!(dmt = dm_task_create(DM_DEVICE_CLEAR))) {
+		log_error("Table clear dm_task creation failed for %s", name);
+		goto_out;
+	}
+
+	if (!dm_task_set_major(dmt, info->major) ||
+	    !dm_task_set_minor(dmt, info->minor)) {
+		log_error("Failed to set device number for %s table clear", name);
+		goto_out;
+	}
+
+	r = dm_task_run(dmt);
+
+	if (!dm_task_get_info(dmt, info)) {
+		log_error("_node_clear_table failed: info missing after running task for %s", name);
+		r = 0;
+	}
+
+	if (!r || !deps)
+		goto_out;
+
+	/*
+	 * Remove (incomplete) devices that the inactive table referred to but
+	 * which are not in the tree, no longer referenced and don't have a live
+	 * table.
+	 */
+	default_uuid_prefix = dm_uuid_prefix();
+	default_uuid_prefix_len = strlen(default_uuid_prefix);
+
+	for (i = 0; i < deps->count; i++) {
+		/* If already in tree, assume it's under control */
+		if (_find_dm_tree_node(dnode->dtree, MAJOR(deps->device[i]), MINOR(deps->device[i])))
+			continue;
+
+		if (!_info_by_dev(MAJOR(deps->device[i]), MINOR(deps->device[i]), 1,
+				  &deps_info, dnode->dtree->mem, &name, &uuid))
+			continue;
+
+		/* Proceed if device is an 'orphan' - unreferenced and without a live table. */
+		if (!deps_info.exists || deps_info.live_table || deps_info.open_count)
+			continue;
+
+		if (strncmp(uuid, default_uuid_prefix, default_uuid_prefix_len))
+			continue;
+
+		/* Remove device. */
+		if (!_deactivate_node(name, deps_info.major, deps_info.minor, &dnode->dtree->cookie, udev_flags, 0)) {
+			log_error("Failed to deactivate no-longer-used device %s (%"
+				  PRIu32 ":%" PRIu32 ")", name, deps_info.major, deps_info.minor);
+		} else if (deps_info.suspended)
+			dec_suspended();
+	}
+
+out:
+	if (dmt)
+		dm_task_destroy(dmt);
+
+	if (deps_dmt)
+		dm_task_destroy(deps_dmt);
+
+	return r;
+}
+
+struct dm_tree_node *dm_tree_add_new_dev_with_udev_flags(struct dm_tree *dtree,
+							 const char *name,
+							 const char *uuid,
+							 uint32_t major,
+							 uint32_t minor,
+							 int read_only,
+							 int clear_inactive,
+							 void *context,
+							 uint16_t udev_flags)
+{
+	struct dm_tree_node *dnode;
+	struct dm_info info = { 0 };
+	const char *name2;
+	const char *uuid2;
+
+	if (!name || !uuid) {
+		log_error("Cannot add device without name and uuid.");
+		return NULL;
+	}
+
+	/* Do we need to add node to tree? */
+	if (!(dnode = dm_tree_find_node_by_uuid(dtree, uuid))) {
+		if (!(name2 = dm_pool_strdup(dtree->mem, name))) {
+			log_error("name pool_strdup failed");
+			return NULL;
+		}
+		if (!(uuid2 = dm_pool_strdup(dtree->mem, uuid))) {
+			log_error("uuid pool_strdup failed");
+			return NULL;
+		}
+
+		if (!(dnode = _create_dm_tree_node(dtree, name2, uuid2, &info,
+						   context, 0)))
+			return_NULL;
+
+		/* Attach to root node until a table is supplied */
+		if (!_add_to_toplevel(dnode) || !_add_to_bottomlevel(dnode))
+			return_NULL;
+
+		dnode->props.major = major;
+		dnode->props.minor = minor;
+		dnode->props.new_name = NULL;
+		dnode->props.size_changed = 0;
+	} else if (strcmp(name, dnode->name)) {
+		/* Do we need to rename node? */
+		if (!(dnode->props.new_name = dm_pool_strdup(dtree->mem, name))) {
+			log_error("name pool_strdup failed");
+			return NULL;
+		}
+	}
+
+	dnode->props.read_only = read_only ? 1 : 0;
+	dnode->props.read_ahead = DM_READ_AHEAD_AUTO;
+	dnode->props.read_ahead_flags = 0;
+
+	if (clear_inactive && !_node_clear_table(dnode, udev_flags))
+		return_NULL;
+
+	dnode->context = context;
+	dnode->udev_flags = udev_flags;
+
+	return dnode;
+}
+
+struct dm_tree_node *dm_tree_add_new_dev(struct dm_tree *dtree, const char *name,
+					 const char *uuid, uint32_t major, uint32_t minor,
+					 int read_only, int clear_inactive, void *context)
+{
+	return dm_tree_add_new_dev_with_udev_flags(dtree, name, uuid, major, minor,
+						   read_only, clear_inactive, context, 0);
+}
+
+static struct dm_tree_node *_add_dev(struct dm_tree *dtree,
+				     struct dm_tree_node *parent,
+				     uint32_t major, uint32_t minor,
+				     uint16_t udev_flags)
+{
+	struct dm_task *dmt = NULL;
+	struct dm_info info;
+	struct dm_deps *deps = NULL;
+	const char *name = NULL;
+	const char *uuid = NULL;
+	struct dm_tree_node *node = NULL;
+	uint32_t i;
+	int new = 0;
+
+	/* Already in tree? */
+	if (!(node = _find_dm_tree_node(dtree, major, minor))) {
+		if (!_deps(&dmt, dtree->mem, major, minor, &name, &uuid, 0, &info, &deps))
+			return_NULL;
+
+		if (!(node = _create_dm_tree_node(dtree, name, uuid, &info,
+						  NULL, udev_flags)))
+			goto_out;
+		new = 1;
+	}
+
+	if (!_link_tree_nodes(parent, node)) {
+		node = NULL;
+		goto_out;
+	}
+
+	/* If node was already in tree, no need to recurse. */
+	if (!new)
+		goto out;
+
+	/* Can't recurse if not a mapped device or there are no dependencies */
+	if (!node->info.exists || !deps || !deps->count) {
+		if (!_add_to_bottomlevel(node)) {
+			stack;
+			node = NULL;
+		}
+		goto out;
+	}
+
+	/* Add dependencies to tree */
+	for (i = 0; i < deps->count; i++)
+		if (!_add_dev(dtree, node, MAJOR(deps->device[i]),
+			      MINOR(deps->device[i]), udev_flags)) {
+			node = NULL;
+			goto_out;
+		}
+
+out:
+	if (dmt)
+		dm_task_destroy(dmt);
+
+	return node;
+}
+
+int dm_tree_add_dev(struct dm_tree *dtree, uint32_t major, uint32_t minor)
+{
+	return _add_dev(dtree, &dtree->root, major, minor, 0) ? 1 : 0;
+}
+
+int dm_tree_add_dev_with_udev_flags(struct dm_tree *dtree, uint32_t major,
+				    uint32_t minor, uint16_t udev_flags)
+{
+	return _add_dev(dtree, &dtree->root, major, minor, udev_flags) ? 1 : 0;
 }
 
 static int _rename_node(const char *old_name, const char *new_name, uint32_t major,
@@ -1002,7 +1235,7 @@ static int _rename_node(const char *old_name, const char *new_name, uint32_t maj
 	}
 
 	if (!dm_task_set_newname(dmt, new_name))
-                goto_out;
+		goto_out;
 
 	if (!dm_task_no_open_count(dmt))
 		log_error("Failed to disable open_count");
@@ -1022,7 +1255,7 @@ out:
 static int _resume_node(const char *name, uint32_t major, uint32_t minor,
 			uint32_t read_ahead, uint32_t read_ahead_flags,
 			struct dm_info *newinfo, uint32_t *cookie,
-			uint16_t udev_flags)
+			uint16_t udev_flags, int already_suspended)
 {
 	struct dm_task *dmt;
 	int r = 0;
@@ -1030,13 +1263,13 @@ static int _resume_node(const char *name, uint32_t major, uint32_t minor,
 	log_verbose("Resuming %s (%" PRIu32 ":%" PRIu32 ")", name, major, minor);
 
 	if (!(dmt = dm_task_create(DM_DEVICE_RESUME))) {
-		log_error("Suspend dm_task creation failed for %s", name);
+		log_debug("Suspend dm_task creation failed for %s.", name);
 		return 0;
 	}
 
 	/* FIXME Kernel should fill in name on return instead */
 	if (!dm_task_set_name(dmt, name)) {
-		log_error("Failed to set readahead device name for %s", name);
+		log_debug("Failed to set device name for %s resumption.", name);
 		goto out;
 	}
 
@@ -1052,10 +1285,16 @@ static int _resume_node(const char *name, uint32_t major, uint32_t minor,
 		log_error("Failed to set read ahead");
 
 	if (!dm_task_set_cookie(dmt, cookie, udev_flags))
-		goto out;
+		goto_out;
 
-	if ((r = dm_task_run(dmt)))
-		r = dm_task_get_info(dmt, newinfo);
+	if (!(r = dm_task_run(dmt)))
+		goto_out;
+
+	if (already_suspended)
+		dec_suspended();
+
+	if (!(r = dm_task_get_info(dmt, newinfo)))
+		stack;
 
 out:
 	dm_task_destroy(dmt);
@@ -1094,12 +1333,174 @@ static int _suspend_node(const char *name, uint32_t major, uint32_t minor,
 	if (no_flush && !dm_task_no_flush(dmt))
 		log_error("Failed to set no_flush flag.");
 
-	if ((r = dm_task_run(dmt)))
+	if ((r = dm_task_run(dmt))) {
+		inc_suspended();
 		r = dm_task_get_info(dmt, newinfo);
+	}
 
 	dm_task_destroy(dmt);
 
 	return r;
+}
+
+static int _thin_pool_status_transaction_id(struct dm_tree_node *dnode, uint64_t *transaction_id)
+{
+	struct dm_task *dmt;
+	int r = 0;
+	uint64_t start, length;
+	char *type = NULL;
+	char *params = NULL;
+
+	if (!(dmt = dm_task_create(DM_DEVICE_STATUS)))
+		return_0;
+
+	if (!dm_task_set_major(dmt, dnode->info.major) ||
+	    !dm_task_set_minor(dmt, dnode->info.minor)) {
+		log_error("Failed to set major minor.");
+		goto out;
+	}
+
+	if (!dm_task_run(dmt))
+		goto_out;
+
+	dm_get_next_target(dmt, NULL, &start, &length, &type, &params);
+
+	if (type && (strcmp(type, "thin-pool") != 0)) {
+		log_error("Expected thin-pool target for %d:%d and got %s.",
+			  dnode->info.major, dnode->info.minor, type);
+		goto out;
+	}
+
+	if (!params || (sscanf(params, "%" PRIu64, transaction_id) != 1)) {
+		log_error("Failed to parse transaction_id from %s.", params);
+		goto out;
+	}
+
+	log_debug("Thin pool transaction id: %" PRIu64 " status: %s.", *transaction_id, params);
+
+	r = 1;
+out:
+	dm_task_destroy(dmt);
+
+	return r;
+}
+
+static int _thin_pool_node_message(struct dm_tree_node *dnode, struct thin_message *tm)
+{
+	struct dm_task *dmt;
+	struct dm_thin_message *m = &tm->message;
+	char buf[64];
+	int r;
+
+	switch (m->type) {
+	case DM_THIN_MESSAGE_CREATE_SNAP:
+		r = dm_snprintf(buf, sizeof(buf), "create_snap %u %u",
+				m->u.m_create_snap.device_id,
+				m->u.m_create_snap.origin_id);
+		break;
+	case DM_THIN_MESSAGE_CREATE_THIN:
+		r = dm_snprintf(buf, sizeof(buf), "create_thin %u",
+				m->u.m_create_thin.device_id);
+		break;
+	case DM_THIN_MESSAGE_DELETE:
+		r = dm_snprintf(buf, sizeof(buf), "delete %u",
+				m->u.m_delete.device_id);
+		break;
+	case DM_THIN_MESSAGE_SET_TRANSACTION_ID:
+		r = dm_snprintf(buf, sizeof(buf),
+				"set_transaction_id %" PRIu64 " %" PRIu64,
+				m->u.m_set_transaction_id.current_id,
+				m->u.m_set_transaction_id.new_id);
+		break;
+	case DM_THIN_MESSAGE_RESERVE_METADATA_SNAP: /* target vsn 1.1 */
+		r = dm_snprintf(buf, sizeof(buf), "reserve_metadata_snap");
+		break;
+	case DM_THIN_MESSAGE_RELEASE_METADATA_SNAP: /* target vsn 1.1 */
+		r = dm_snprintf(buf, sizeof(buf), "release_metadata_snap");
+		break;
+	default:
+		r = -1;
+	}
+
+	if (r < 0) {
+		log_error("Failed to prepare message.");
+		return 0;
+	}
+
+	r = 0;
+
+	if (!(dmt = dm_task_create(DM_DEVICE_TARGET_MSG)))
+		return_0;
+
+	if (!dm_task_set_major(dmt, dnode->info.major) ||
+	    !dm_task_set_minor(dmt, dnode->info.minor)) {
+		log_error("Failed to set message major minor.");
+		goto out;
+	}
+
+	if (!dm_task_set_message(dmt, buf))
+		goto_out;
+
+        /* Internal functionality of dm_task */
+	dmt->expected_errno = tm->expected_errno;
+
+	if (!dm_task_run(dmt))
+		goto_out;
+
+	r = 1;
+out:
+	dm_task_destroy(dmt);
+
+	return r;
+}
+
+static int _node_send_messages(struct dm_tree_node *dnode,
+			       const char *uuid_prefix,
+			       size_t uuid_prefix_len)
+{
+	struct load_segment *seg;
+	struct thin_message *tmsg;
+	uint64_t trans_id;
+	const char *uuid;
+
+	if (!dnode->info.exists || (dm_list_size(&dnode->props.segs) != 1))
+		return 1;
+
+	seg = dm_list_item(dm_list_last(&dnode->props.segs), struct load_segment);
+	if (seg->type != SEG_THIN_POOL)
+		return 1;
+
+	if (!(uuid = dm_tree_node_get_uuid(dnode)))
+		return_0;
+
+	if (!_uuid_prefix_matches(uuid, uuid_prefix, uuid_prefix_len)) {
+		log_debug("UUID \"%s\" does not match.", uuid);
+		return 1;
+	}
+
+	if (!_thin_pool_status_transaction_id(dnode, &trans_id))
+		goto_bad;
+
+	if (trans_id == seg->transaction_id)
+		return 1; /* In sync - skip messages */
+
+	if (trans_id != (seg->transaction_id - 1)) {
+		log_error("Thin pool transaction_id=%" PRIu64 ", while expected: %" PRIu64 ".",
+			  trans_id, seg->transaction_id - 1);
+		goto bad; /* Nothing to send */
+	}
+
+	dm_list_iterate_items(tmsg, &seg->thin_messages)
+		if (!(_thin_pool_node_message(dnode, tmsg)))
+			goto_bad;
+
+	return 1;
+bad:
+	/* Try to deactivate */
+	if (!(dm_tree_deactivate_children(dnode, uuid_prefix, uuid_prefix_len)))
+		log_error("Failed to deactivate %s", dnode->name);
+
+	return 0;
 }
 
 /*
@@ -1139,13 +1540,34 @@ static int _dm_tree_deactivate_children(struct dm_tree_node *dnode,
 			continue;
 
 		/* Refresh open_count */
-		if (!_info_by_dev(dinfo->major, dinfo->minor, 1, &info) ||
+		if (!_info_by_dev(dinfo->major, dinfo->minor, 1, &info, NULL, NULL, NULL) ||
 		    !info.exists)
 			continue;
 
+		if (info.open_count) {
+			/* Skip internal non-toplevel opened nodes */
+			if (level)
+				continue;
+
+			/* When retry is not allowed, error */
+			if (!child->dtree->retry_remove) {
+				log_error("Unable to deactivate open %s (%" PRIu32
+					  ":%" PRIu32 ")", name, info.major, info.minor);
+				r = 0;
+				continue;
+			}
+
+			/* Check toplevel node for holders/mounted fs */
+			if (!_check_device_not_in_use(name, &info)) {
+				stack;
+				r = 0;
+				continue;
+			}
+			/* Go on with retry */
+		}
+
 		/* Also checking open_count in parent nodes of presuspend_node */
-		if (info.open_count ||
-		    (child->presuspend_node &&
+		if ((child->presuspend_node &&
 		     !_node_has_closed_parents(child->presuspend_node,
 					       uuid_prefix, uuid_prefix_len))) {
 			/* Only report error from (likely non-internal) dependency at top level */
@@ -1164,18 +1586,27 @@ static int _dm_tree_deactivate_children(struct dm_tree_node *dnode,
 			continue;
 
 		if (!_deactivate_node(name, info.major, info.minor,
-				      &child->dtree->cookie, child->udev_flags)) {
+				      &child->dtree->cookie, child->udev_flags,
+				      (level == 0) ? child->dtree->retry_remove : 0)) {
 			log_error("Unable to deactivate %s (%" PRIu32
 				  ":%" PRIu32 ")", name, info.major,
 				  info.minor);
 			r = 0;
 			continue;
-		}
+		} else if (info.suspended)
+			dec_suspended();
 
-		if (dm_tree_node_num_children(child, 0)) {
-			if (!_dm_tree_deactivate_children(child, uuid_prefix, uuid_prefix_len, level + 1))
-				return_0;
-		}
+		if (child->callback &&
+		    !child->callback(child, DM_NODE_CALLBACK_DEACTIVATED,
+				     child->callback_data))
+			stack;
+			// FIXME: We need to let lvremove pass,
+			// so for now deactivation ignores check result
+			//r = 0; // FIXME: _node_clear_table() without callback ?
+
+		if (dm_tree_node_num_children(child, 0) &&
+		    !_dm_tree_deactivate_children(child, uuid_prefix, uuid_prefix_len, level + 1))
+			return_0;
 	}
 
 	return r;
@@ -1186,16 +1617,6 @@ int dm_tree_deactivate_children(struct dm_tree_node *dnode,
 				   size_t uuid_prefix_len)
 {
 	return _dm_tree_deactivate_children(dnode, uuid_prefix, uuid_prefix_len, 0);
-}
-
-void dm_tree_skip_lockfs(struct dm_tree_node *dnode)
-{
-	dnode->dtree->skip_lockfs = 1;
-}
-
-void dm_tree_use_no_flush_suspend(struct dm_tree_node *dnode)
-{
-	dnode->dtree->no_flush = 1;
 }
 
 int dm_tree_suspend_children(struct dm_tree_node *dnode,
@@ -1235,7 +1656,7 @@ int dm_tree_suspend_children(struct dm_tree_node *dnode,
 		if (!_children_suspended(child, 1, uuid_prefix, uuid_prefix_len))
 			continue;
 
-		if (!_info_by_dev(dinfo->major, dinfo->minor, 0, &info) ||
+		if (!_info_by_dev(dinfo->major, dinfo->minor, 0, &info, NULL, NULL, NULL) ||
 		    !info.exists || info.suspended)
 			continue;
 
@@ -1305,15 +1726,15 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
 
 	for (priority = 0; priority < 3; priority++) {
 		while ((child = dm_tree_next_child(&handle, dnode, 0))) {
+			if (priority != child->activation_priority)
+				continue;
+
 			if (!(uuid = dm_tree_node_get_uuid(child))) {
 				stack;
 				continue;
 			}
 
 			if (!_uuid_prefix_matches(uuid, uuid_prefix, uuid_prefix_len))
-				continue;
-
-			if (priority != child->activation_priority)
 				continue;
 
 			if (!(name = dm_tree_node_get_name(child))) {
@@ -1340,7 +1761,7 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
 
 			if (!_resume_node(child->name, child->info.major, child->info.minor,
 					  child->props.read_ahead, child->props.read_ahead_flags,
-					  &newinfo, &child->dtree->cookie, child->udev_flags)) {
+					  &newinfo, &child->dtree->cookie, child->udev_flags, child->info.suspended)) {
 				log_error("Unable to resume %s (%" PRIu32
 					  ":%" PRIu32 ")", child->name, child->info.major,
 					  child->info.minor);
@@ -1352,6 +1773,17 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
 			child->info = newinfo;
 		}
 	}
+
+	/*
+	 * FIXME: Implement delayed error reporting
+	 * activation should be stopped only in the case,
+	 * the submission of transation_id message fails,
+	 * resume should continue further, just whole command
+	 * has to report failure.
+	 */
+	if (r && dnode->props.send_messages &&
+	    !(r = _node_send_messages(dnode, uuid_prefix, uuid_prefix_len)))
+		stack;
 
 	handle = NULL;
 
@@ -1408,10 +1840,10 @@ out:
 static int _build_dev_string(char *devbuf, size_t bufsize, struct dm_tree_node *node)
 {
 	if (!dm_format_dev(devbuf, bufsize, node->info.major, node->info.minor)) {
-                log_error("Failed to format %s device number for %s as dm "
-                          "target (%u,%u)",
-                          node->name, node->uuid, node->info.major, node->info.minor);
-                return 0;
+		log_error("Failed to format %s device number for %s as dm "
+			  "target (%u,%u)",
+			  node->name, node->uuid, node->info.major, node->info.minor);
+		return 0;
 	}
 
 	return 1;
@@ -1444,11 +1876,11 @@ static int _emit_areas_line(struct dm_task *dmt __attribute__((unused)),
 	unsigned log_parm_count;
 
 	dm_list_iterate_items(area, &seg->areas) {
-		if (!_build_dev_string(devbuf, sizeof(devbuf), area->dev_node))
-			return_0;
-
 		switch (seg->type) {
 		case SEG_REPLICATOR_DEV:
+			if (!_build_dev_string(devbuf, sizeof(devbuf), area->dev_node))
+				return_0;
+
 			EMIT_PARAMS(*pos, " %d 1 %s", area->rsite_index, devbuf);
 			if (first_time)
 				EMIT_PARAMS(*pos, " nolog 0");
@@ -1481,7 +1913,29 @@ static int _emit_areas_line(struct dm_task *dmt __attribute__((unused)),
 					EMIT_PARAMS(*pos, "%s", synctype);
 			}
 			break;
+		case SEG_RAID1:
+		case SEG_RAID10:
+		case SEG_RAID4:
+		case SEG_RAID5_LA:
+		case SEG_RAID5_RA:
+		case SEG_RAID5_LS:
+		case SEG_RAID5_RS:
+		case SEG_RAID6_ZR:
+		case SEG_RAID6_NR:
+		case SEG_RAID6_NC:
+			if (!area->dev_node) {
+				EMIT_PARAMS(*pos, " -");
+				break;
+			}
+			if (!_build_dev_string(devbuf, sizeof(devbuf), area->dev_node))
+				return_0;
+
+			EMIT_PARAMS(*pos, " %s", devbuf);
+			break;
 		default:
+			if (!_build_dev_string(devbuf, sizeof(devbuf), area->dev_node))
+				return_0;
+
 			EMIT_PARAMS(*pos, "%s%s %" PRIu64, first_time ? "" : " ",
 				    devbuf, area->offset);
 		}
@@ -1531,23 +1985,28 @@ static int _replicator_emit_segment_line(const struct load_segment *seg, char *p
 /*
  * Returns: 1 on success, 0 on failure
  */
-static int _mirror_emit_segment_line(struct dm_task *dmt, uint32_t major,
-				     uint32_t minor, struct load_segment *seg,
-				     uint64_t *seg_start, char *params,
-				     size_t paramsize)
+static int _mirror_emit_segment_line(struct dm_task *dmt, struct load_segment *seg,
+				     char *params, size_t paramsize)
 {
 	int block_on_error = 0;
 	int handle_errors = 0;
 	int dm_log_userspace = 0;
 	struct utsname uts;
 	unsigned log_parm_count;
-	int pos = 0;
+	int pos = 0, parts;
 	char logbuf[DM_FORMAT_DEV_BUFSIZE];
 	const char *logtype;
-	unsigned kmaj, kmin, krel;
+	unsigned kmaj = 0, kmin = 0, krel = 0;
 
-	if (uname(&uts) == -1 || sscanf(uts.release, "%u.%u.%u", &kmaj, &kmin, &krel) != 3) {
-		log_error("Cannot read kernel release version");
+	if (uname(&uts) == -1) {
+		log_error("Cannot read kernel release version.");
+		return 0;
+	}
+
+	/* Kernels with a major number of 2 always had 3 parts. */
+	parts = sscanf(uts.release, "%u.%u.%u", &kmaj, &kmin, &krel);
+	if (parts < 1 || (kmaj < 3 && parts < 3)) {
+		log_error("Wrong kernel release version %s.", uts.release);
 		return 0;
 	}
 
@@ -1651,6 +2110,103 @@ static int _mirror_emit_segment_line(struct dm_task *dmt, uint32_t major,
 	return 1;
 }
 
+static int _raid_emit_segment_line(struct dm_task *dmt, uint32_t major,
+				   uint32_t minor, struct load_segment *seg,
+				   uint64_t *seg_start, char *params,
+				   size_t paramsize)
+{
+	uint32_t i;
+	int param_count = 1; /* mandatory 'chunk size'/'stripe size' arg */
+	int pos = 0;
+
+	if ((seg->flags & DM_NOSYNC) || (seg->flags & DM_FORCESYNC))
+		param_count++;
+
+	if (seg->region_size)
+		param_count += 2;
+
+	/* rebuilds is 64-bit */
+	param_count += 2 * hweight32(seg->rebuilds & 0xFFFFFFFF);
+	param_count += 2 * hweight32(seg->rebuilds >> 32);
+
+	if ((seg->type == SEG_RAID1) && seg->stripe_size)
+		log_error("WARNING: Ignoring RAID1 stripe size");
+
+	EMIT_PARAMS(pos, "%s %d %u", dm_segtypes[seg->type].target,
+		    param_count, seg->stripe_size);
+
+	if (seg->flags & DM_NOSYNC)
+		EMIT_PARAMS(pos, " nosync");
+	else if (seg->flags & DM_FORCESYNC)
+		EMIT_PARAMS(pos, " sync");
+
+	if (seg->region_size)
+		EMIT_PARAMS(pos, " region_size %u", seg->region_size);
+
+	for (i = 0; i < (seg->area_count / 2); i++)
+		if (seg->rebuilds & (1 << i))
+			EMIT_PARAMS(pos, " rebuild %u", i);
+
+	/* Print number of metadata/data device pairs */
+	EMIT_PARAMS(pos, " %u", seg->area_count/2);
+
+	if (_emit_areas_line(dmt, seg, params, paramsize, &pos) <= 0)
+		return_0;
+
+	return 1;
+}
+
+static int _thin_pool_emit_segment_line(struct dm_task *dmt,
+					struct load_segment *seg,
+					char *params, size_t paramsize)
+{
+	int pos = 0;
+	char pool[DM_FORMAT_DEV_BUFSIZE], metadata[DM_FORMAT_DEV_BUFSIZE];
+	int features = (seg->skip_block_zeroing ? 1 : 0) +
+			(seg->ignore_discard ? 1 : 0) +
+			(seg->no_discard_passdown ? 1 : 0);
+
+	if (!_build_dev_string(metadata, sizeof(metadata), seg->metadata))
+		return_0;
+
+	if (!_build_dev_string(pool, sizeof(pool), seg->pool))
+		return_0;
+
+	EMIT_PARAMS(pos, "%s %s %d %" PRIu64 " %d%s%s%s", metadata, pool,
+		    seg->data_block_size, seg->low_water_mark, features,
+		    seg->skip_block_zeroing ? " skip_block_zeroing" : "",
+		    seg->ignore_discard ? " ignore_discard" : "",
+		    seg->no_discard_passdown ? " no_discard_passdown" : ""
+		   );
+
+	return 1;
+}
+
+static int _thin_emit_segment_line(struct dm_task *dmt,
+				   struct load_segment *seg,
+				   char *params, size_t paramsize)
+{
+	int pos = 0;
+	char pool[DM_FORMAT_DEV_BUFSIZE];
+	char external[DM_FORMAT_DEV_BUFSIZE + 1];
+
+	if (!_build_dev_string(pool, sizeof(pool), seg->pool))
+		return_0;
+
+	if (!seg->external)
+		*external = 0;
+	else {
+		*external = ' ';
+		if (!_build_dev_string(external + 1, sizeof(external) - 1,
+				       seg->external))
+			return_0;
+	}
+
+	EMIT_PARAMS(pos, "%s %d%s", pool, seg->device_id, external);
+
+	return 1;
+}
+
 static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 			      uint32_t minor, struct load_segment *seg,
 			      uint64_t *seg_start, char *params,
@@ -1658,6 +2214,7 @@ static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 {
 	int pos = 0;
 	int r;
+	int target_type_is_raid = 0;
 	char originbuf[DM_FORMAT_DEV_BUFSIZE], cowbuf[DM_FORMAT_DEV_BUFSIZE];
 
 	switch(seg->type) {
@@ -1667,8 +2224,7 @@ static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 		break;
 	case SEG_MIRRORED:
 		/* Mirrors are pretty complicated - now in separate function */
-		r = _mirror_emit_segment_line(dmt, major, minor, seg, seg_start,
-					      params, paramsize);
+		r = _mirror_emit_segment_line(dmt, seg, params, paramsize);
 		if (!r)
 			return_0;
 		break;
@@ -1711,6 +2267,31 @@ static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 			    seg->iv_offset != DM_CRYPT_IV_DEFAULT ?
 			    seg->iv_offset : *seg_start);
 		break;
+	case SEG_RAID1:
+	case SEG_RAID10:
+	case SEG_RAID4:
+	case SEG_RAID5_LA:
+	case SEG_RAID5_RA:
+	case SEG_RAID5_LS:
+	case SEG_RAID5_RS:
+	case SEG_RAID6_ZR:
+	case SEG_RAID6_NR:
+	case SEG_RAID6_NC:
+		target_type_is_raid = 1;
+		r = _raid_emit_segment_line(dmt, major, minor, seg, seg_start,
+					    params, paramsize);
+		if (!r)
+			return_0;
+
+		break;
+	case SEG_THIN_POOL:
+		if (!_thin_pool_emit_segment_line(dmt, seg, params, paramsize))
+			return_0;
+		break;
+	case SEG_THIN:
+		if (!_thin_emit_segment_line(dmt, seg, params, paramsize))
+			return_0;
+		break;
 	}
 
 	switch(seg->type) {
@@ -1720,6 +2301,8 @@ static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 	case SEG_SNAPSHOT_ORIGIN:
 	case SEG_SNAPSHOT_MERGE:
 	case SEG_ZERO:
+	case SEG_THIN_POOL:
+	case SEG_THIN:
 		break;
 	case SEG_CRYPT:
 	case SEG_LINEAR:
@@ -1729,14 +2312,23 @@ static int _emit_segment_line(struct dm_task *dmt, uint32_t major,
 			stack;
 			return r;
 		}
+		if (!params[0]) {
+			log_error("No parameters supplied for %s target "
+				  "%u:%u.", dm_segtypes[seg->type].target,
+				  major, minor);
+			return 0;
+		}
 		break;
 	}
 
 	log_debug("Adding target to (%" PRIu32 ":%" PRIu32 "): %" PRIu64
 		  " %" PRIu64 " %s %s", major, minor,
-		  *seg_start, seg->size, dm_segtypes[seg->type].target, params);
+		  *seg_start, seg->size, target_type_is_raid ? "raid" :
+		  dm_segtypes[seg->type].target, params);
 
-	if (!dm_task_add_target(dmt, *seg_start, seg->size, dm_segtypes[seg->type].target, params))
+	if (!dm_task_add_target(dmt, *seg_start, seg->size,
+				target_type_is_raid ? "raid" :
+				dm_segtypes[seg->type].target, params))
 		return_0;
 
 	*seg_start += seg->size;
@@ -1785,7 +2377,7 @@ static int _load_node(struct dm_tree_node *dnode)
 	int r = 0;
 	struct dm_task *dmt;
 	struct load_segment *seg;
-	uint64_t seg_start = 0;
+	uint64_t seg_start = 0, existing_table_size;
 
 	log_verbose("Loading %s table (%" PRIu32 ":%" PRIu32 ")", dnode->name,
 		    dnode->info.major, dnode->info.minor);
@@ -1820,15 +2412,28 @@ static int _load_node(struct dm_tree_node *dnode)
 	if ((r = dm_task_run(dmt))) {
 		r = dm_task_get_info(dmt, &dnode->info);
 		if (r && !dnode->info.inactive_table)
-			log_verbose("Suppressed %s identical table reload.",
-				    dnode->name);
+			log_verbose("Suppressed %s (%" PRIu32 ":%" PRIu32
+				    ") identical table reload.",
+				    dnode->name,
+				    dnode->info.major, dnode->info.minor);
 
+		existing_table_size = dm_task_get_existing_table_size(dmt);
 		if ((dnode->props.size_changed =
-		     (dm_task_get_existing_table_size(dmt) == seg_start) ? 0 : 1))
+		     (existing_table_size == seg_start) ? 0 : 1)) {
+			/*
+			 * Kernel usually skips size validation on zero-length devices
+			 * now so no need to preload them.
+			 */
+			/* FIXME In which kernel version did this begin? */
+			if (!existing_table_size && dnode->props.delay_resume_if_new)
+				dnode->props.size_changed = 0;
+
 			log_debug("Table size changed from %" PRIu64 " to %"
-				  PRIu64 " for %s",
-				  dm_task_get_existing_table_size(dmt),
-				  seg_start, dnode->name);
+				  PRIu64 " for %s (%" PRIu32 ":%" PRIu32 ").%s",
+				  existing_table_size, seg_start, dnode->name,
+				  dnode->info.major, dnode->info.minor,
+				  dnode->props.size_changed ? "" : " (Ignoring.)");
+		}
 	}
 
 	dnode->props.segment_count = 0;
@@ -1865,19 +2470,13 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 				return_0;
 
 		/* FIXME Cope if name exists with no uuid? */
-		if (!child->info.exists) {
-			if (!_create_node(child)) {
-				stack;
-				return 0;
-			}
-		}
+		if (!child->info.exists && !_create_node(child))
+			return_0;
 
-		if (!child->info.inactive_table && child->props.segment_count) {
-			if (!_load_node(child)) {
-				stack;
-				return 0;
-			}
-		}
+		if (!child->info.inactive_table &&
+		    child->props.segment_count &&
+		    !_load_node(child))
+			return_0;
 
 		/* Propagate device size change change */
 		if (child->props.size_changed)
@@ -1892,7 +2491,8 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 
 		if (!_resume_node(child->name, child->info.major, child->info.minor,
 				  child->props.read_ahead, child->props.read_ahead_flags,
-				  &newinfo, &child->dtree->cookie, child->udev_flags)) {
+				  &newinfo, &child->dtree->cookie, child->udev_flags,
+				  child->info.suspended)) {
 			log_error("Unable to resume %s (%" PRIu32
 				  ":%" PRIu32 ")", child->name, child->info.major,
 				  child->info.minor);
@@ -1902,7 +2502,6 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 
 		/* Update cached info */
 		child->info = newinfo;
-
 		/*
 		 * Prepare for immediate synchronization with udev and flush all stacked
 		 * dev node operations if requested by immediate_dev_node property. But
@@ -1910,16 +2509,18 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 		 */
 		if (child->props.immediate_dev_node)
 			update_devs_flag = 1;
-
 	}
 
-	handle = NULL;
-
-	if (update_devs_flag) {
+	if (update_devs_flag ||
+	    (!dnode->info.exists && dnode->callback)) {
 		if (!dm_udev_wait(dm_tree_get_cookie(dnode)))
 			stack;
 		dm_tree_set_cookie(dnode, 0);
-		dm_task_update_nodes();
+
+		if (!dnode->info.exists && dnode->callback &&
+		    !dnode->callback(child, DM_NODE_CALLBACK_PRELOADED,
+				     dnode->callback_data))
+			return_0;
 	}
 
 	return r;
@@ -1982,8 +2583,8 @@ static struct load_segment *_add_segment(struct dm_tree_node *dnode, unsigned ty
 }
 
 int dm_tree_node_add_snapshot_origin_target(struct dm_tree_node *dnode,
-                                               uint64_t size,
-                                               const char *origin_uuid)
+					       uint64_t size,
+					       const char *origin_uuid)
 {
 	struct load_segment *seg;
 	struct dm_tree_node *origin_node;
@@ -2002,6 +2603,12 @@ int dm_tree_node_add_snapshot_origin_target(struct dm_tree_node *dnode,
 
 	/* Resume snapshot origins after new snapshots */
 	dnode->activation_priority = 1;
+
+	/*
+	 * Don't resume the origin immediately in case it is a non-trivial 
+	 * target that must not be active more than once concurrently!
+	 */
+	origin_node->props.delay_resume_if_new = 1;
 
 	return 1;
 }
@@ -2088,7 +2695,7 @@ int dm_tree_node_add_snapshot_merge_target(struct dm_tree_node *node,
 }
 
 int dm_tree_node_add_error_target(struct dm_tree_node *node,
-                                     uint64_t size)
+				     uint64_t size)
 {
 	if (!_add_segment(node, SEG_ERROR, size))
 		return_0;
@@ -2097,7 +2704,7 @@ int dm_tree_node_add_error_target(struct dm_tree_node *node,
 }
 
 int dm_tree_node_add_zero_target(struct dm_tree_node *node,
-                                    uint64_t size)
+				    uint64_t size)
 {
 	if (!_add_segment(node, SEG_ZERO, size))
 		return_0;
@@ -2106,7 +2713,7 @@ int dm_tree_node_add_zero_target(struct dm_tree_node *node,
 }
 
 int dm_tree_node_add_linear_target(struct dm_tree_node *node,
-                                      uint64_t size)
+				      uint64_t size)
 {
 	if (!_add_segment(node, SEG_LINEAR, size))
 		return_0;
@@ -2115,8 +2722,8 @@ int dm_tree_node_add_linear_target(struct dm_tree_node *node,
 }
 
 int dm_tree_node_add_striped_target(struct dm_tree_node *node,
-                                       uint64_t size,
-                                       uint32_t stripe_size)
+				       uint64_t size,
+				       uint32_t stripe_size)
 {
 	struct load_segment *seg;
 
@@ -2172,7 +2779,10 @@ int dm_tree_node_add_mirror_target_log(struct dm_tree_node *node,
 			log_error("log uuid pool_strdup failed");
 			return 0;
 		}
-		if (!(flags & DM_CORELOG)) {
+		if ((flags & DM_CORELOG))
+			/* For pvmove: immediate resume (for size validation) isn't needed. */
+			node->props.delay_resume_if_new = 1;
+		else {
 			if (!(log_node = dm_tree_find_node_by_uuid(node->dtree, log_uuid))) {
 				log_error("Couldn't find mirror log uuid %s.", log_uuid);
 				return 0;
@@ -2180,6 +2790,10 @@ int dm_tree_node_add_mirror_target_log(struct dm_tree_node *node,
 
 			if (clustered)
 				log_node->props.immediate_dev_node = 1;
+
+			/* The kernel validates the size of disk logs. */
+			/* FIXME Propagate to any devices below */
+			log_node->props.delay_resume_if_new = 0;
 
 			if (!_link_tree_nodes(node, log_node))
 				return_0;
@@ -2196,10 +2810,39 @@ int dm_tree_node_add_mirror_target_log(struct dm_tree_node *node,
 }
 
 int dm_tree_node_add_mirror_target(struct dm_tree_node *node,
-                                      uint64_t size)
+				      uint64_t size)
 {
 	if (!_add_segment(node, SEG_MIRRORED, size))
 		return_0;
+
+	return 1;
+}
+
+int dm_tree_node_add_raid_target(struct dm_tree_node *node,
+				 uint64_t size,
+				 const char *raid_type,
+				 uint32_t region_size,
+				 uint32_t stripe_size,
+				 uint64_t rebuilds,
+				 uint64_t flags)
+{
+	int i;
+	struct load_segment *seg = NULL;
+
+	for (i = 0; dm_segtypes[i].target && !seg; i++)
+		if (!strcmp(raid_type, dm_segtypes[i].target))
+			if (!(seg = _add_segment(node,
+						 dm_segtypes[i].type, size)))
+				return_0;
+
+	if (!seg)
+		return_0;
+
+	seg->region_size = region_size;
+	seg->stripe_size = stripe_size;
+	seg->area_count = 0;
+	seg->rebuilds = rebuilds;
+	seg->flags = flags;
 
 	return 1;
 }
@@ -2369,6 +3012,296 @@ int dm_tree_node_add_replicator_dev_target(struct dm_tree_node *node,
 	return 1;
 }
 
+static struct load_segment *_get_single_load_segment(struct dm_tree_node *node,
+						     unsigned type)
+{
+	struct load_segment *seg;
+
+	if (node->props.segment_count != 1) {
+		log_error("Node %s must have only one segment.",
+			  dm_segtypes[type].target);
+		return NULL;
+	}
+
+	seg = dm_list_item(dm_list_last(&node->props.segs), struct load_segment);
+	if (seg->type != type) {
+		log_error("Node %s has segment type %s.",
+			  dm_segtypes[type].target,
+			  dm_segtypes[seg->type].target);
+		return NULL;
+	}
+
+	return seg;
+}
+
+static int _thin_validate_device_id(uint32_t device_id)
+{
+	if (device_id > DM_THIN_MAX_DEVICE_ID) {
+		log_error("Device id %u is higher then %u.",
+			  device_id, DM_THIN_MAX_DEVICE_ID);
+		return 0;
+	}
+
+	return 1;
+}
+
+int dm_tree_node_add_thin_pool_target(struct dm_tree_node *node,
+				      uint64_t size,
+				      uint64_t transaction_id,
+				      const char *metadata_uuid,
+				      const char *pool_uuid,
+				      uint32_t data_block_size,
+				      uint64_t low_water_mark,
+				      unsigned skip_block_zeroing)
+{
+	struct load_segment *seg, *mseg;
+	uint64_t devsize = 0;
+	/*
+	 * Max supported size for thin pool  metadata device
+	 * Limitation is hardcoded into kernel and bigger
+	 * device size is not accepted. (16978542592)
+	 */
+	const uint64_t max_metadata_size =
+		255ULL * (1 << 14) * (4096 / (1 << 9)) - 256 * 1024;
+
+	if (data_block_size < DM_THIN_MIN_DATA_BLOCK_SIZE) {
+		log_error("Data block size %u is lower then %u sectors.",
+			  data_block_size, DM_THIN_MIN_DATA_BLOCK_SIZE);
+		return 0;
+	}
+
+	if (data_block_size > DM_THIN_MAX_DATA_BLOCK_SIZE) {
+		log_error("Data block size %u is higher then %u sectors.",
+			  data_block_size, DM_THIN_MAX_DATA_BLOCK_SIZE);
+		return 0;
+	}
+
+	if (!(seg = _add_segment(node, SEG_THIN_POOL, size)))
+		return_0;
+
+	if (!(seg->metadata = dm_tree_find_node_by_uuid(node->dtree, metadata_uuid))) {
+		log_error("Missing metadata uuid %s.", metadata_uuid);
+		return 0;
+	}
+
+	if (!_link_tree_nodes(node, seg->metadata))
+		return_0;
+
+	/* FIXME: more complex target may need more tweaks */
+	dm_list_iterate_items(mseg, &seg->metadata->props.segs) {
+		devsize += mseg->size;
+		if (devsize > max_metadata_size) {
+			log_debug("Ignoring %" PRIu64 " of device.",
+				  devsize - max_metadata_size);
+			mseg->size -= (devsize - max_metadata_size);
+			devsize = max_metadata_size;
+			/* FIXME: drop remaining segs */
+		}
+	}
+
+	if (!(seg->pool = dm_tree_find_node_by_uuid(node->dtree, pool_uuid))) {
+		log_error("Missing pool uuid %s.", pool_uuid);
+		return 0;
+	}
+
+	if (!_link_tree_nodes(node, seg->pool))
+		return_0;
+
+	/* Clean flag delay_resume_if_new - so corelog gets resumed */
+	seg->metadata->props.delay_resume_if_new = 0;
+	seg->pool->props.delay_resume_if_new = 0;
+
+	node->props.send_messages = 1;
+	seg->transaction_id = transaction_id;
+	seg->low_water_mark = low_water_mark;
+	seg->data_block_size = data_block_size;
+	seg->skip_block_zeroing = skip_block_zeroing;
+	dm_list_init(&seg->thin_messages);
+
+	return 1;
+}
+
+int dm_tree_node_add_thin_pool_message(struct dm_tree_node *node,
+				       dm_thin_message_t type,
+				       uint64_t id1, uint64_t id2)
+{
+	struct thin_message *tm;
+	struct load_segment *seg;
+
+	if (!(seg = _get_single_load_segment(node, SEG_THIN_POOL)))
+		return_0;
+
+	if (!(tm = dm_pool_zalloc(node->dtree->mem, sizeof (*tm)))) {
+		log_error("Failed to allocate thin message.");
+		return 0;
+	}
+
+	switch (type) {
+	case DM_THIN_MESSAGE_CREATE_SNAP:
+		/* If the thin origin is active, it must be suspend first! */
+		if (id1 == id2) {
+			log_error("Cannot use same device id for origin and its snapshot.");
+			return 0;
+		}
+		if (!_thin_validate_device_id(id1) ||
+		    !_thin_validate_device_id(id2))
+			return_0;
+		tm->message.u.m_create_snap.device_id = id1;
+		tm->message.u.m_create_snap.origin_id = id2;
+		break;
+	case DM_THIN_MESSAGE_CREATE_THIN:
+		if (!_thin_validate_device_id(id1))
+			return_0;
+		tm->message.u.m_create_thin.device_id = id1;
+		tm->expected_errno = EEXIST;
+		break;
+	case DM_THIN_MESSAGE_DELETE:
+		if (!_thin_validate_device_id(id1))
+			return_0;
+		tm->message.u.m_delete.device_id = id1;
+		tm->expected_errno = ENODATA;
+		break;
+	case DM_THIN_MESSAGE_SET_TRANSACTION_ID:
+		if ((id1 + 1) != id2) {
+			log_error("New transaction id must be sequential.");
+			return 0; /* FIXME: Maybe too strict here? */
+		}
+		if (id2 != seg->transaction_id) {
+			log_error("Current transaction id is different from thin pool.");
+			return 0; /* FIXME: Maybe too strict here? */
+		}
+		tm->message.u.m_set_transaction_id.current_id = id1;
+		tm->message.u.m_set_transaction_id.new_id = id2;
+		break;
+	default:
+		log_error("Unsupported message type %d.", (int) type);
+		return 0;
+	}
+
+	tm->message.type = type;
+	dm_list_add(&seg->thin_messages, &tm->list);
+
+	return 1;
+}
+
+int dm_tree_node_set_thin_pool_discard(struct dm_tree_node *node,
+				       unsigned ignore,
+				       unsigned no_passdown)
+{
+	struct load_segment *seg;
+
+	if (!(seg = _get_single_load_segment(node, SEG_THIN_POOL)))
+		return_0;
+
+	seg->ignore_discard = ignore;
+	seg->no_discard_passdown = no_passdown;
+
+	return 1;
+}
+
+int dm_tree_node_add_thin_target(struct dm_tree_node *node,
+				 uint64_t size,
+				 const char *pool_uuid,
+				 uint32_t device_id)
+{
+	struct dm_tree_node *pool;
+	struct load_segment *seg;
+
+	if (!(pool = dm_tree_find_node_by_uuid(node->dtree, pool_uuid))) {
+		log_error("Missing thin pool uuid %s.", pool_uuid);
+		return 0;
+	}
+
+	if (!_link_tree_nodes(node, pool))
+		return_0;
+
+	if (!_thin_validate_device_id(device_id))
+		return_0;
+
+	if (!(seg = _add_segment(node, SEG_THIN, size)))
+		return_0;
+
+	seg->pool = pool;
+	seg->device_id = device_id;
+
+	return 1;
+}
+
+int dm_tree_node_set_thin_external_origin(struct dm_tree_node *node,
+					  const char *external_uuid)
+{
+	struct dm_tree_node *external;
+	struct load_segment *seg;
+
+	if (!(seg = _get_single_load_segment(node, SEG_THIN)))
+		return_0;
+
+	if (!(external = dm_tree_find_node_by_uuid(node->dtree,
+						   external_uuid))) {
+		log_error("Missing thin external origin uuid %s.",
+			  external_uuid);
+		return 0;
+	}
+
+	if (!_link_tree_nodes(node, external))
+		return_0;
+
+	seg->external = external;
+
+	return 1;
+}
+
+int dm_get_status_thin_pool(struct dm_pool *mem, const char *params,
+			    struct dm_status_thin_pool **status)
+{
+	struct dm_status_thin_pool *s;
+
+	if (!(s = dm_pool_zalloc(mem, sizeof(struct dm_status_thin_pool)))) {
+		log_error("Failed to allocate thin_pool status structure.");
+		return 0;
+	}
+
+	/* FIXME: add support for held metadata root */
+	if (sscanf(params, "%" PRIu64 " %" PRIu64 "/%" PRIu64 " %" PRIu64 "/%" PRIu64,
+		   &s->transaction_id,
+		   &s->used_metadata_blocks,
+		   &s->total_metadata_blocks,
+		   &s->used_data_blocks,
+		   &s->total_data_blocks) != 5) {
+		log_error("Failed to parse thin pool params: %s.", params);
+		return 0;
+	}
+
+	*status = s;
+
+	return 1;
+}
+
+int dm_get_status_thin(struct dm_pool *mem, const char *params,
+		       struct dm_status_thin **status)
+{
+	struct dm_status_thin *s;
+
+	if (!(s = dm_pool_zalloc(mem, sizeof(struct dm_status_thin)))) {
+		log_error("Failed to allocate thin status structure.");
+		return 0;
+	}
+
+	if (strchr(params, '-')) {
+		s->mapped_sectors = 0;
+		s->highest_mapped_sector = 0;
+	} else if (sscanf(params, "%" PRIu64 " %" PRIu64,
+		   &s->mapped_sectors,
+		   &s->highest_mapped_sector) != 2) {
+		log_error("Failed to parse thin params: %s.", params);
+		return 0;
+	}
+
+	*status = s;
+
+	return 1;
+}
+
 static int _add_area(struct dm_tree_node *node, struct load_segment *seg, struct dm_tree_node *dev_node, uint64_t offset)
 {
 	struct seg_area *area;
@@ -2388,9 +3321,9 @@ static int _add_area(struct dm_tree_node *node, struct load_segment *seg, struct
 }
 
 int dm_tree_node_add_target_area(struct dm_tree_node *node,
-                                    const char *dev_name,
-                                    const char *uuid,
-                                    uint64_t offset)
+				    const char *dev_name,
+				    const char *uuid,
+				    uint64_t offset)
 {
 	struct load_segment *seg;
 	struct stat info;
@@ -2409,12 +3342,12 @@ int dm_tree_node_add_target_area(struct dm_tree_node *node,
 		if (!_link_tree_nodes(node, dev_node))
 			return_0;
 	} else {
-        	if (stat(dev_name, &info) < 0) {
+		if (stat(dev_name, &info) < 0) {
 			log_error("Device %s not found.", dev_name);
 			return 0;
 		}
 
-        	if (!S_ISBLK(info.st_mode)) {
+		if (!S_ISBLK(info.st_mode)) {
 			log_error("Device %s is not a block device.", dev_name);
 			return 0;
 		}
@@ -2438,12 +3371,37 @@ int dm_tree_node_add_target_area(struct dm_tree_node *node,
 	return 1;
 }
 
-void dm_tree_set_cookie(struct dm_tree_node *node, uint32_t cookie)
+int dm_tree_node_add_null_area(struct dm_tree_node *node, uint64_t offset)
 {
-	node->dtree->cookie = cookie;
+	struct load_segment *seg;
+
+	seg = dm_list_item(dm_list_last(&node->props.segs), struct load_segment);
+
+	switch (seg->type) {
+	case SEG_RAID1:
+	case SEG_RAID4:
+	case SEG_RAID5_LA:
+	case SEG_RAID5_RA:
+	case SEG_RAID5_LS:
+	case SEG_RAID5_RS:
+	case SEG_RAID6_ZR:
+	case SEG_RAID6_NR:
+	case SEG_RAID6_NC:
+		break;
+	default:
+		log_error("dm_tree_node_add_null_area() called on an unsupported segment type");
+		return 0;
+	}
+
+	if (!_add_area(node, seg, NULL, offset))
+		return_0;
+
+	return 1;
 }
 
-uint32_t dm_tree_get_cookie(struct dm_tree_node *node)
+void dm_tree_node_set_callback(struct dm_tree_node *dnode,
+			       dm_node_callback_fn cb, void *data)
 {
-	return node->dtree->cookie;
+	dnode->callback = cb;
+	dnode->callback_data = data;
 }

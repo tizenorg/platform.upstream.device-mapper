@@ -29,6 +29,15 @@
 static const char SINGLENODE_CLVMD_SOCKNAME[] = DEFAULT_RUN_DIR "/clvmd_singlenode.sock";
 static int listen_fd = -1;
 
+static struct dm_hash_table *_locks;
+static int _lockid;
+
+struct lock {
+	int lockid;
+	int mode;
+	int excl;
+};
+
 static void close_comms(void)
 {
 	if (listen_fd != -1 && close(listen_fd))
@@ -39,8 +48,15 @@ static void close_comms(void)
 
 static int init_comms(void)
 {
-	struct sockaddr_un addr;
 	mode_t old_mask;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+
+	if (!dm_strncpy(addr.sun_path, SINGLENODE_CLVMD_SOCKNAME,
+			sizeof(addr.sun_path))) {
+		DEBUGLOG("%s: singlenode socket name too long.",
+			 SINGLENODE_CLVMD_SOCKNAME);
+		return -1;
+	}
 
 	close_comms();
 
@@ -53,12 +69,10 @@ static int init_comms(void)
 		goto error;
 	}
 	/* Set Close-on-exec */
-	fcntl(listen_fd, F_SETFD, 1);
-
-	memset(&addr, 0, sizeof(addr));
-	memcpy(addr.sun_path, SINGLENODE_CLVMD_SOCKNAME,
-	       sizeof(SINGLENODE_CLVMD_SOCKNAME));
-	addr.sun_family = AF_UNIX;
+	if (fcntl(listen_fd, F_SETFD, 1)) {
+		DEBUGLOG("Setting CLOEXEC on client fd failed: %s\n", strerror(errno));
+		goto error;
+	}
 
 	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		DEBUGLOG("Can't bind local socket: %s\n", strerror(errno));
@@ -83,9 +97,16 @@ static int _init_cluster(void)
 {
 	int r;
 
+	if (!(_locks = dm_hash_create(128))) {
+		DEBUGLOG("Failed to allocate single-node hash table.\n");
+		return 1;
+	}
+
 	r = init_comms();
-	if (r)
+	if (r) {
+		dm_hash_destroy(_locks);
 		return r;
+	}
 
 	DEBUGLOG("Single-node cluster initialised.\n");
 	return 0;
@@ -97,6 +118,9 @@ static void _cluster_closedown(void)
 
 	DEBUGLOG("cluster_closedown\n");
 	destroy_lvhash();
+	dm_hash_destroy(_locks);
+	_locks = NULL;
+	_lockid = 0;
 }
 
 static void _get_our_csid(char *csid)
@@ -136,95 +160,101 @@ static int _cluster_do_node_callback(struct local_client *master_client,
 
 int _lock_file(const char *file, uint32_t flags);
 
-static int *_locks = NULL;
-static char **_resources = NULL;
-static int _lock_max = 1;
 static pthread_mutex_t _lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Using one common condition for all locks for simplicity */
+static pthread_cond_t _lock_cond = PTHREAD_COND_INITIALIZER;
 
 /* Real locking */
 static int _lock_resource(const char *resource, int mode, int flags, int *lockid)
 {
-	int *_locks_1;
-	char **_resources_1;
-	int i, j;
+	struct lock *lck;
 
-	DEBUGLOG("lock_resource '%s', flags=%d, mode=%d\n",
+	DEBUGLOG("Locking resource %s, flags=%d, mode=%d\n",
 		 resource, flags, mode);
 
- retry:
+	mode &= LCK_TYPE_MASK;
 	pthread_mutex_lock(&_lock_mutex);
+retry:
+	if (!(lck = dm_hash_lookup(_locks, resource))) {
+		/* Add new locked resource */
+		if (!(lck = dm_zalloc(sizeof(struct lock))) ||
+		    !dm_hash_insert(_locks, resource, lck))
+			goto bad;
 
-	/* look for an existing lock for this resource */
-	for (i = 1; i < _lock_max; ++i) {
-		if (!_resources[i])
-			break;
-		if (!strcmp(_resources[i], resource)) {
-			if ((_locks[i] & LCK_TYPE_MASK) == LCK_WRITE ||
-			    (_locks[i] & LCK_TYPE_MASK) == LCK_EXCL) {
-				DEBUGLOG("%s already write/exclusively locked...\n", resource);
-				goto maybe_retry;
-			}
-			if ((mode & LCK_TYPE_MASK) == LCK_WRITE ||
-			    (mode & LCK_TYPE_MASK) == LCK_EXCL) {
-				DEBUGLOG("%s already locked and WRITE/EXCL lock requested...\n",
-					 resource);
-				goto maybe_retry;
-			}
-		}
+		lck->lockid = ++_lockid;
+		goto out;
 	}
 
-	if (i == _lock_max) { /* out of lock slots, extend */
-		_locks_1 = dm_realloc(_locks, 2 * _lock_max * sizeof(int));
-		if (!_locks_1)
-			return 1; /* fail */
-		_locks = _locks_1;
-		_resources_1 = dm_realloc(_resources, 2 * _lock_max * sizeof(char *));
-		if (!_resources_1) {
-			/* _locks may get realloc'd twice, but that should be safe */
-			return 1; /* fail */
-		}
-		_resources = _resources_1;
-		/* clear the new resource entries */
-		for (j = _lock_max; j < 2 * _lock_max; ++j)
-			_resources[j] = NULL;
-		_lock_max = 2 * _lock_max;
+        /* Update/convert lock */
+	if (flags == LCKF_CONVERT) {
+		if (lck->excl)
+			mode = LCK_EXCL;
+	} else if ((lck->mode == LCK_WRITE) || (lck->mode == LCK_EXCL)) {
+		DEBUGLOG("Resource %s already %s locked (%d)...\n", resource,
+			 (lck->mode == LCK_WRITE) ? "write" : "exclusively", lck->lockid);
+		goto maybe_retry;
+	} else if (lck->mode > mode) {
+		DEBUGLOG("Resource %s already locked and %s lock requested...\n",
+			 resource,
+			 (mode == LCK_READ) ? "READ" :
+			 (mode == LCK_WRITE) ? "WRITE" : "EXCLUSIVE");
+		goto maybe_retry;
 	}
 
-	/* resource is not currently locked, grab it */
-
-	*lockid = i;
-	_locks[i] = mode;
-	_resources[i] = dm_strdup(resource);
-
-	DEBUGLOG("%s locked -> %d\n", resource, i);
-
+out:
+	*lockid = lck->lockid;
+	lck->mode = mode;
+	lck->excl |= (mode == LCK_EXCL);
+	DEBUGLOG("Locked resource %s, lockid=%d, mode=%d\n", resource, lck->lockid, mode);
+	pthread_cond_broadcast(&_lock_cond); /* wakeup waiters */
 	pthread_mutex_unlock(&_lock_mutex);
+
 	return 0;
- maybe_retry:
-	pthread_mutex_unlock(&_lock_mutex);
+
+maybe_retry:
 	if (!(flags & LCK_NONBLOCK)) {
-		usleep(10000);
+		pthread_cond_wait(&_lock_cond, &_lock_mutex);
+		DEBUGLOG("Resource %s RETRYING lock...\n", resource);
 		goto retry;
 	}
+bad:
+	DEBUGLOG("Failed to lock resource %s\n", resource);
+	pthread_mutex_unlock(&_lock_mutex);
 
 	return 1; /* fail */
 }
 
 static int _unlock_resource(const char *resource, int lockid)
 {
-	DEBUGLOG("unlock_resource: %s lockid: %x\n", resource, lockid);
-	if(!_resources[lockid]) {
-		DEBUGLOG("(%s) %d not locked\n", resource, lockid);
-		return 1;
+	struct lock *lck;
+
+	if (lockid < 0) {
+		DEBUGLOG("Not tracking unlock of lockid -1: %s, lockid=%d\n",
+			 resource, lockid);
+		return 0;
 	}
-	if(strcmp(_resources[lockid], resource)) {
-		DEBUGLOG("%d has wrong resource (requested %s, got %s)\n",
-			 lockid, resource, _resources[lockid]);
+
+	DEBUGLOG("Unlocking resource %s, lockid=%d\n", resource, lockid);
+	pthread_mutex_lock(&_lock_mutex);
+
+	if (!(lck = dm_hash_lookup(_locks, resource))) {
+		pthread_mutex_unlock(&_lock_mutex);
+		DEBUGLOG("Resource %s, lockid=%d is not locked.\n", resource, lockid);
 		return 1;
 	}
 
-	dm_free(_resources[lockid]);
-	_resources[lockid] = 0;
+	if (lck->lockid != lockid) {
+		pthread_mutex_unlock(&_lock_mutex);
+		DEBUGLOG("Resource %s has wrong lockid %d, expected %d.\n",
+			 resource, lck->lockid, lockid);
+		return 1;
+	}
+
+	dm_hash_remove(_locks, resource);
+	dm_free(lck);
+	pthread_cond_broadcast(&_lock_cond); /* wakeup waiters */
+	pthread_mutex_unlock(&_lock_mutex);
+
 	return 0;
 }
 
@@ -260,6 +290,7 @@ static int _get_cluster_name(char *buf, int buflen)
 }
 
 static struct cluster_ops _cluster_singlenode_ops = {
+	.name                     = "singlenode",
 	.cluster_init_completed   = NULL,
 	.cluster_send_message     = _cluster_send_message,
 	.name_from_csid           = _name_from_csid,

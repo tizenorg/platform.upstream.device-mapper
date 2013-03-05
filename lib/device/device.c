@@ -287,7 +287,7 @@ int get_primary_dev(const char *sysfs_dir,
 	struct stat info;
 	FILE *fp;
 	uint32_t pri_maj, pri_min;
-	int ret = 0;
+	int size, ret = 0;
 
 	/* check if dev is a partition */
 	if (dm_snprintf(path, PATH_MAX, "%s/dev/block/%d:%d/partition",
@@ -309,10 +309,12 @@ int get_primary_dev(const char *sysfs_dir,
 	 * - basename ../../block/md0/md0  = md0
 	 * Parent's 'dev' sysfs attribute  = /sys/block/md0/dev
 	 */
-	if (readlink(dirname(path), temp_path, PATH_MAX) < 0) {
+	if ((size = readlink(dirname(path), temp_path, PATH_MAX)) < 0) {
 		log_sys_error("readlink", path);
 		return ret;
 	}
+
+	temp_path[size] = '\0';
 
 	if (dm_snprintf(path, PATH_MAX, "%s/block/%s/dev",
 			sysfs_dir, basename(dirname(temp_path))) < 0) {
@@ -345,7 +347,7 @@ int get_primary_dev(const char *sysfs_dir,
 			  path, buffer);
 		goto out;
 	}
-	*result = MKDEV(pri_maj, pri_min);
+	*result = MKDEV((dev_t)pri_maj, pri_min);
 	ret = 1;
 
 out:
@@ -359,7 +361,7 @@ static unsigned long _dev_topology_attribute(const char *attribute,
 					     const char *sysfs_dir,
 					     struct device *dev)
 {
-	const char *sysfs_fmt_str = "%s/dev/block/%d:%d/%s";
+	static const char sysfs_fmt_str[] = "%s/dev/block/%d:%d/%s";
 	char path[PATH_MAX+1], buffer[64];
 	FILE *fp;
 	struct stat info;
@@ -453,6 +455,20 @@ unsigned long dev_optimal_io_size(const char *sysfs_dir,
 				       sysfs_dir, dev);
 }
 
+unsigned long dev_discard_max_bytes(const char *sysfs_dir,
+				    struct device *dev)
+{
+	return _dev_topology_attribute("queue/discard_max_bytes",
+				       sysfs_dir, dev);
+}
+
+unsigned long dev_discard_granularity(const char *sysfs_dir,
+				      struct device *dev)
+{
+	return _dev_topology_attribute("queue/discard_granularity",
+				       sysfs_dir, dev);
+}
+
 #else
 
 int get_primary_dev(const char *sysfs_dir,
@@ -475,6 +491,18 @@ unsigned long dev_minimum_io_size(const char *sysfs_dir,
 
 unsigned long dev_optimal_io_size(const char *sysfs_dir,
 				  struct device *dev)
+{
+	return 0UL;
+}
+
+unsigned long dev_discard_max_bytes(const char *sysfs_dir,
+				    struct device *dev)
+{
+	return 0UL;
+}
+
+unsigned long dev_discard_granularity(const char *sysfs_dir,
+				      struct device *dev)
 {
 	return 0UL;
 }

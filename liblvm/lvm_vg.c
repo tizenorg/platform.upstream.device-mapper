@@ -56,7 +56,7 @@ vg_t lvm_vg_create(lvm_t libh, const char *vg_name)
 	vg = vg_create((struct cmd_context *)libh, vg_name);
 	/* FIXME: error handling is still TBD */
 	if (vg_read_error(vg)) {
-		free_vg(vg);
+		release_vg(vg);
 		return NULL;
 	}
 	vg->open_mode = 'w';
@@ -79,7 +79,7 @@ int lvm_vg_extend(vg_t vg, const char *device)
 	}
 
 	pvcreate_params_set_defaults(&pp);
-	if (!vg_extend(vg, 1, (char **) &device, &pp)) {
+	if (!vg_extend(vg, 1, &device, &pp)) {
 		unlock_vg(vg->cmd, VG_ORPHANS);
 		return -1;
 	}
@@ -98,7 +98,7 @@ int lvm_vg_reduce(vg_t vg, const char *device)
 	if (!vg_check_write_mode(vg))
 		return -1;
 
-	if (!vg_reduce(vg, (char *)device))
+	if (!vg_reduce(vg, device))
 		return -1;
 	return 0;
 }
@@ -147,6 +147,7 @@ int lvm_vg_write(vg_t vg)
 	if (! dm_list_empty(&vg->removed_pvs)) {
 		dm_list_iterate_items(pvl, &vg->removed_pvs) {
 			pv_write_orphan(vg->cmd, pvl->pv);
+			pv_set_fid(pvl->pv, NULL);
 			/* FIXME: do pvremove / label_remove()? */
 		}
 		dm_list_init(&vg->removed_pvs);
@@ -159,9 +160,9 @@ int lvm_vg_write(vg_t vg)
 int lvm_vg_close(vg_t vg)
 {
 	if (vg_read_error(vg) == FAILED_LOCKING)
-		free_vg(vg);
+		release_vg(vg);
 	else
-		unlock_and_free_vg(vg->cmd, vg, vg->name);
+		unlock_and_release_vg(vg->cmd, vg, vg->name);
 	return 0;
 }
 
@@ -196,7 +197,7 @@ vg_t lvm_vg_open(lvm_t libh, const char *vgname, const char *mode,
 	vg = vg_read((struct cmd_context *)libh, vgname, NULL, internal_flags);
 	if (vg_read_error(vg)) {
 		/* FIXME: use log_errno either here in inside vg_read */
-		free_vg(vg);
+		release_vg(vg);
 		return NULL;
 	}
 	/* FIXME: combine this with locking ? */

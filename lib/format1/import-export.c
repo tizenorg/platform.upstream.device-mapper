@@ -25,7 +25,6 @@
 #include "segtype.h"
 #include "pv_alloc.h"
 #include "display.h"
-#include "lvmcache.h"
 #include "metadata.h"
 
 #include <time.h>
@@ -96,6 +95,8 @@ int import_pv(const struct format_type *fmt, struct dm_pool *mem,
 	pv->pe_count = pvd->pe_total;
 	pv->pe_alloc_count = 0;
 	pv->pe_align = 0;
+        pv->is_labelled = 0; /* format1 PVs have no label */
+        pv->label_sector = 0;
 
 	/* Fix up pv size if missing or impossibly large */
 	if (!pv->size || pv->size > (1ULL << 62)) {
@@ -149,7 +150,7 @@ int export_pv(struct cmd_context *cmd, struct dm_pool *mem __attribute__((unused
 
 	memcpy(pvd->pv_uuid, pv->id.uuid, ID_LEN);
 
-	if (pv->vg_name && !is_orphan(pv)) {
+	if (pv->vg_name && !is_orphan(pv) && !(pv->status & UNLABELLED_PV)) {
 		if (!_check_vg_name(pv->vg_name))
 			return_0;
 		strncpy((char *)pvd->vg_name, pv->vg_name, sizeof(pvd->vg_name));
@@ -225,7 +226,7 @@ int import_vg(struct dm_pool *mem,
 	if (!(vg->name = dm_pool_strdup(mem, (char *)dl->pvd.vg_name)))
 		return_0;
 
-	if (!(vg->system_id = dm_pool_alloc(mem, NAME_LEN)))
+	if (!(vg->system_id = dm_pool_zalloc(mem, NAME_LEN + 1)))
 		return_0;
 
 	*vg->system_id = '\0';
@@ -554,7 +555,7 @@ int export_lvs(struct disk_list *dl, struct volume_group *vg,
 int import_snapshots(struct dm_pool *mem __attribute__((unused)), struct volume_group *vg,
 		     struct dm_list *pvds)
 {
-	struct logical_volume *lvs[MAX_LV];
+	struct logical_volume *lvs[MAX_LV] = { 0 };
 	struct disk_list *dl;
 	struct lvd_list *ll;
 	struct lv_disk *lvd;
@@ -562,7 +563,6 @@ int import_snapshots(struct dm_pool *mem __attribute__((unused)), struct volume_
 	struct logical_volume *org, *cow;
 
 	/* build an index of lv numbers */
-	memset(lvs, 0, sizeof(lvs));
 	dm_list_iterate_items(dl, pvds) {
 		dm_list_iterate_items(ll, &dl->lvds) {
 			lvd = &ll->lvd;

@@ -31,10 +31,13 @@ lvm_t lvm_init(const char *system_dir)
 	/* FIXME: logging bound to handle
 	 */
 
+	if (!udev_init_library_context())
+		stack;
+
 	/* create context */
 	/* FIXME: split create_toolcontext */
 	/* FIXME: make all globals configurable */
-	cmd = create_toolcontext(0, system_dir);
+	cmd = create_toolcontext(0, system_dir, 0, 0);
 	if (!cmd)
 		return NULL;
 
@@ -69,6 +72,7 @@ lvm_t lvm_init(const char *system_dir)
 void lvm_quit(lvm_t libh)
 {
 	destroy_toolcontext((struct cmd_context *)libh);
+	udev_fin_library_context();
 }
 
 int lvm_config_reload(lvm_t libh)
@@ -88,6 +92,11 @@ int lvm_config_override(lvm_t libh, const char *config_settings)
 	if (override_config_tree_from_string(cmd, config_settings))
 		return -1;
 	return 0;
+}
+
+int lvm_config_find_bool(lvm_t libh, const char *config_path, int fail)
+{
+	return find_config_tree_bool((struct cmd_context *)libh, config_path, fail);
 }
 
 int lvm_errno(lvm_t libh)
@@ -116,4 +125,9 @@ const char *lvm_vgname_from_device(lvm_t libh, const char *device)
 {
 	struct cmd_context *cmd = (struct cmd_context *)libh;
 	return find_vgname_from_pvname(cmd, device);
+}
+
+float lvm_percent_to_float(percent_t v)
+{
+	return percent_to_float(v);
 }

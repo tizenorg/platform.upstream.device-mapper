@@ -235,10 +235,8 @@ static int rw_log(struct log_c *lc, int do_write)
  */
 static int read_log(struct log_c *lc)
 {
-	struct log_header lh;
+	struct log_header lh = { 0 };
 	size_t bitset_size;
-
-	memset(&lh, 0, sizeof(struct log_header));
 
 	if (rw_log(lc, 0))
 		return -EIO; /* Failed disk read */
@@ -329,19 +327,26 @@ static int find_disk_path(char *major_minor_str, char *path_rtn, int *unlink_pat
 		 */
 
 		sprintf(path_rtn, "/dev/mapper/%s", dep->d_name);
-		stat(path_rtn, &statbuf);
+		if (stat(path_rtn, &statbuf) < 0) {
+			LOG_DBG("Unable to stat %s", path_rtn);
+			continue;
+		}
 		if (S_ISBLK(statbuf.st_mode) &&
 		    (major(statbuf.st_rdev) == major) &&
 		    (minor(statbuf.st_rdev) == minor)) {
 			LOG_DBG("  %s: YES", dep->d_name);
-			closedir(dp);
+			if (closedir(dp))
+				LOG_DBG("Unable to closedir /dev/mapper %s",
+					strerror(errno));
 			return 0;
 		} else {
 			LOG_DBG("  %s: NO", dep->d_name);
 		}
 	}
 
-	closedir(dp);
+	if (closedir(dp))
+		LOG_DBG("Unable to closedir /dev/mapper %s",
+			strerror(errno));
 
 	/* FIXME Find out why this was here and deal with underlying problem. */
 	LOG_DBG("Path not found for %d/%d", major, minor);
@@ -369,10 +374,10 @@ static int _clog_ctr(char *uuid, uint64_t luid,
 	enum sync log_sync = DEFAULTSYNC;
 	uint32_t block_on_error = 0;
 
-	int disk_log = 0;
+	int disk_log;
 	char disk_path[128];
 	int unlink_path = 0;
-	size_t page_size;
+	long page_size;
 	int pages;
 
 	/* If core log request, then argv[0] will be region_size */
@@ -476,7 +481,12 @@ static int _clog_ctr(char *uuid, uint64_t luid,
 	lc->sync_count = (log_sync == NOSYNC) ? region_count : 0;
 
 	if (disk_log) {
-		page_size = sysconf(_SC_PAGESIZE);
+		if ((page_size = sysconf(_SC_PAGESIZE)) < 0) {
+			LOG_ERROR("Unable to read pagesize: %s",
+				  strerror(errno));
+			r = errno;
+			goto fail;
+		}
 		pages = *(lc->clean_bits) / page_size;
 		pages += *(lc->clean_bits) % page_size ? 1 : 0;
 		pages += 1; /* for header */
@@ -489,7 +499,10 @@ static int _clog_ctr(char *uuid, uint64_t luid,
 			goto fail;
 		}
 		if (unlink_path)
-			unlink(disk_path);
+			if (unlink(disk_path) < 0) {
+				LOG_DBG("Warning: Unable to unlink log device, %s: %s",
+					disk_path, strerror(errno));
+			}
 
 		lc->disk_fd = r;
 		lc->disk_size = pages * page_size;
@@ -586,7 +599,10 @@ static int clog_ctr(struct dm_ulog_request *rq)
 	/* We join the CPG when we resume */
 
 	/* No returning data */
-	rq->data_size = 0;
+	if ((rq->version > 1) && !strcmp(argv[0], "clustered-disk"))
+		rq->data_size = sprintf(rq->data, "%s", argv[1]) + 1;
+	else
+		rq->data_size = 0;
 
 	if (r) {
 		LOG_ERROR("Failed to create cluster log (%s)", rq->uuid);
@@ -626,8 +642,9 @@ static int clog_dtr(struct dm_ulog_request *rq)
 	LOG_DBG("[%s] Cluster log removed", SHORT_UUID(lc->uuid));
 
 	dm_list_del(&lc->list);
-	if (lc->disk_fd != -1)
-		close(lc->disk_fd);
+	if (lc->disk_fd != -1 && close(lc->disk_fd))
+		LOG_ERROR("Failed to close disk log: %s",
+			  strerror(errno));
 	if (lc->disk_buffer)
 		free(lc->disk_buffer);
 	dm_free(lc->clean_bits);
@@ -770,7 +787,7 @@ static int clog_resume(struct dm_ulog_request *rq)
 		else if (lc->disk_nr_regions > lc->region_count)
 			LOG_DBG("[%s] Mirror has shrunk, updating log bits",
 				SHORT_UUID(lc->uuid));
-		break;		
+		break;
 	case -EINVAL:
 		LOG_DBG("[%s] (Re)initializing mirror log - resync issued.",
 			SHORT_UUID(lc->uuid));
@@ -823,7 +840,7 @@ out:
 	lc->sync_search = 0;
 	lc->state = LOG_RESUMED;
 	lc->recovery_halted = 0;
-	
+
 	return rq->error;
 }
 
@@ -1018,7 +1035,7 @@ static int clog_flush(struct dm_ulog_request *rq, int server)
 {
 	int r = 0;
 	struct log_c *lc = get_log(rq->uuid, rq->luid);
-	
+
 	if (!lc)
 		return -EINVAL;
 
@@ -1600,7 +1617,7 @@ out:
 
 	rq->data_size = sizeof(*pkg);
 
-	return 0;	
+	return 0;
 }
 
 
@@ -1705,13 +1722,11 @@ int do_request(struct clog_request *rq, int server)
 static void print_bits(dm_bitset_t bs, int print)
 {
 	int i, size;
-	char outbuf[128];
+	char outbuf[128] = { 0 };
 	unsigned char *buf = (unsigned char *)(bs + 1);
 
 	size = (*bs % 8) ? 1 : 0;
 	size += (*bs / 8);
-
-	memset(outbuf, 0, sizeof(outbuf));
 
 	for (i = 0; i < size; i++) {
 		if (!(i % 16)) {
@@ -1817,8 +1832,11 @@ int pull_state(const char *uuid, uint64_t luid,
 	}
 
 	if (!strncmp(which, "recovering_region", 17)) {
-		sscanf(buf, "%llu %u", (unsigned long long *)&lc->recovering_region,
-		       &lc->recoverer);
+		if (sscanf(buf, "%llu %u", (unsigned long long *)&lc->recovering_region,
+			   &lc->recoverer) != 2) {
+			LOG_ERROR("cannot parse recovering region from: %s", buf);
+			return -EINVAL;
+		}
 		LOG_SPRINT(lc, "CKPT INIT - SEQ#=X, UUID=%s, nodeid = X:: "
 			   "recovering_region=%llu, recoverer=%u",
 			   SHORT_UUID(lc->uuid),
@@ -1853,7 +1871,7 @@ int pull_state(const char *uuid, uint64_t luid,
 
 		LOG_DBG("[%s] loading clean_bits:", SHORT_UUID(lc->uuid));
 
-		print_bits(lc->sync_bits, 0);
+		print_bits(lc->clean_bits, 0);
 	}
 
 	return 0;

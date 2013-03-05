@@ -17,11 +17,8 @@
 
 /* FIXME This stuff must be configurable. */
 
-#define	DM_EVENT_DAEMON		"/sbin/dmeventd"
-#define DM_EVENT_LOCKFILE	"/var/lock/dmeventd"
-#define	DM_EVENT_FIFO_CLIENT	"/var/run/dmeventd-client"
-#define	DM_EVENT_FIFO_SERVER	"/var/run/dmeventd-server"
-#define DM_EVENT_PIDFILE	"/var/run/dmeventd.pid"
+#define	DM_EVENT_FIFO_CLIENT	DEFAULT_DM_RUN_DIR "/dmeventd-client"
+#define	DM_EVENT_FIFO_SERVER	DEFAULT_DM_RUN_DIR "/dmeventd-server"
 
 #define DM_EVENT_DEFAULT_TIMEOUT 10
 
@@ -66,11 +63,13 @@ struct dm_event_fifos {
 #define EXIT_CHDIR_FAILURE       7
 
 /* Implemented in libdevmapper-event.c, but not part of public API. */
+// FIXME  misuse of bitmask as enum
 int daemon_talk(struct dm_event_fifos *fifos,
 		struct dm_event_daemon_message *msg, int cmd,
 		const char *dso_name, const char *dev_name,
 		enum dm_event_mask evmask, uint32_t timeout);
 int init_fifos(struct dm_event_fifos *fifos);
 void fini_fifos(struct dm_event_fifos *fifos);
+int dm_event_get_version(struct dm_event_fifos *fifos, int *version);
 
 #endif /* __DMEVENTD_DOT_H__ */

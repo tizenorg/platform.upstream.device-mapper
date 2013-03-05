@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2007 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -177,84 +177,60 @@ out:
 	return 0;
 }
 
-static struct volume_group *_build_vg(struct format_instance *fid,
-				      struct dm_list *pvs,
-				      struct dm_pool *mem)
+static struct volume_group *_format1_vg_read(struct format_instance *fid,
+				     const char *vg_name,
+				     struct metadata_area *mda __attribute__((unused)),
+				     int single_device __attribute__((unused)))
 {
-	struct volume_group *vg = dm_pool_zalloc(mem, sizeof(*vg));
+	struct volume_group *vg;
 	struct disk_list *dl;
+	DM_LIST_INIT(pvs);
 
-	if (!vg)
+	/* Strip dev_dir if present */
+	if (vg_name)
+		vg_name = strip_dir(vg_name, fid->fmt->cmd->dev_dir);
+
+	if (!(vg = alloc_vg("format1_vg_read", fid->fmt->cmd, NULL)))
+		return_NULL;
+
+	if (!read_pvs_in_vg(fid->fmt, vg_name, fid->fmt->cmd->filter,
+			    vg->vgmem, &pvs))
 		goto_bad;
 
-	if (dm_list_empty(pvs))
+	if (dm_list_empty(&pvs))
 		goto_bad;
 
-	vg->cmd = fid->fmt->cmd;
-	vg->vgmem = mem;
-	vg->fid = fid;
-	vg->seqno = 0;
-	dm_list_init(&vg->pvs);
-	dm_list_init(&vg->lvs);
-	dm_list_init(&vg->tags);
-	dm_list_init(&vg->removed_pvs);
+	vg_set_fid(vg, fid);
 
-	if (!_check_vgs(pvs, vg))
+	if (!_check_vgs(&pvs, vg))
 		goto_bad;
 
-	dl = dm_list_item(pvs->n, struct disk_list);
+	dl = dm_list_item(pvs.n, struct disk_list);
 
-	if (!import_vg(mem, vg, dl))
+	if (!import_vg(vg->vgmem, vg, dl))
 		goto_bad;
 
-	if (!import_pvs(fid->fmt, mem, vg, pvs))
+	if (!import_pvs(fid->fmt, vg->vgmem, vg, &pvs))
 		goto_bad;
 
-	if (!import_lvs(mem, vg, pvs))
+	if (!import_lvs(vg->vgmem, vg, &pvs))
 		goto_bad;
 
-	if (!import_extents(fid->fmt->cmd, vg, pvs))
+	if (!import_extents(fid->fmt->cmd, vg, &pvs))
 		goto_bad;
 
-	if (!import_snapshots(mem, vg, pvs))
+	if (!import_snapshots(vg->vgmem, vg, &pvs))
 		goto_bad;
 
 	/* Fix extents counts by adding missing PV if partial VG */
-	if ((vg->status & PARTIAL_VG) && !_fix_partial_vg(vg, pvs))
+	if ((vg->status & PARTIAL_VG) && !_fix_partial_vg(vg, &pvs))
 		goto_bad;
 
 	return vg;
 
-      bad:
-	dm_pool_free(mem, vg);
-	return NULL;
-}
-
-static struct volume_group *_format1_vg_read(struct format_instance *fid,
-				     const char *vg_name,
-				     struct metadata_area *mda __attribute__((unused)))
-{
-	struct dm_pool *mem = dm_pool_create("lvm1 vg_read", VG_MEMPOOL_CHUNK);
-	struct dm_list pvs;
-	struct volume_group *vg = NULL;
-	dm_list_init(&pvs);
-
-	if (!mem)
-		return_NULL;
-
-	/* Strip dev_dir if present */
-	vg_name = strip_dir(vg_name, fid->fmt->cmd->dev_dir);
-
-	if (!read_pvs_in_vg
-	    (fid->fmt, vg_name, fid->fmt->cmd->filter, mem, &pvs))
-		goto_bad;
-
-	if (!(vg = _build_vg(fid, &pvs, mem)))
-		goto_bad;
-
-	return vg;
 bad:
-	dm_pool_destroy(mem);
+	release_vg(vg);
+
 	return NULL;
 }
 
@@ -331,8 +307,7 @@ static int _format1_vg_write(struct format_instance *fid, struct volume_group *v
 }
 
 static int _format1_pv_read(const struct format_type *fmt, const char *pv_name,
-		    struct physical_volume *pv, struct dm_list *mdas __attribute__((unused)),
-		    int scan_label_only __attribute__((unused)))
+		    struct physical_volume *pv, int scan_label_only __attribute__((unused)))
 {
 	struct dm_pool *mem = dm_pool_create("lvm1 pv_read", 1024);
 	struct disk_list *dl;
@@ -362,16 +337,14 @@ static int _format1_pv_read(const struct format_type *fmt, const char *pv_name,
 	return r;
 }
 
-static int _format1_pv_setup(const struct format_type *fmt,
-			     uint64_t pe_start, uint32_t extent_count,
-			     uint32_t extent_size,
-			     unsigned long data_alignment __attribute__((unused)),
-			     unsigned long data_alignment_offset __attribute__((unused)),
-			     int pvmetadatacopies __attribute__((unused)),
-			     uint64_t pvmetadatasize __attribute__((unused)),
-			     unsigned metadataignore __attribute__((unused)),
-			     struct dm_list *mdas __attribute__((unused)),
-			     struct physical_volume *pv, struct volume_group *vg __attribute__((unused)))
+static int _format1_pv_initialise(const struct format_type * fmt,
+				  int64_t label_sector __attribute__((unused)),
+				  uint64_t pe_start,
+				  uint32_t extent_count,
+				  uint32_t extent_size,
+				  unsigned long data_alignment __attribute__((unused)),
+				  unsigned long data_alignment_offset __attribute__((unused)),
+				  struct physical_volume * pv)
 {
 	if (pv->size > MAX_PV_SIZE)
 		pv->size--;
@@ -401,6 +374,13 @@ static int _format1_pv_setup(const struct format_type *fmt,
 	return 1;
 }
 
+static int _format1_pv_setup(const struct format_type *fmt,
+			     struct physical_volume *pv,
+			     struct volume_group *vg)
+{
+	return _format1_pv_initialise(fmt, -1, 0, 0, vg->extent_size, 0, 0, pv);
+}
+
 static int _format1_lv_setup(struct format_instance *fid, struct logical_volume *lv)
 {
 	uint64_t max_size = UINT_MAX;
@@ -422,24 +402,28 @@ static int _format1_lv_setup(struct format_instance *fid, struct logical_volume 
 	return 1;
 }
 
-static int _format1_pv_write(const struct format_type *fmt, struct physical_volume *pv,
-		     struct dm_list *mdas __attribute__((unused)), int64_t sector __attribute__((unused)))
+static int _format1_pv_write(const struct format_type *fmt, struct physical_volume *pv)
 {
 	struct dm_pool *mem;
 	struct disk_list *dl;
 	struct dm_list pvs;
 	struct lvmcache_info *info;
+	int pe_count, pe_size, pe_start;
+	int r = 1;
 
 	if (!(info = lvmcache_add(fmt->labeller, (char *) &pv->id, pv->dev,
 				  pv->vg_name, NULL, 0)))
 		return_0;
 
-	info->device_size = pv->size << SECTOR_SHIFT;
-	info->fmt = fmt;
-
-	dm_list_init(&info->mdas);
+	lvmcache_update_pv(info, pv, fmt);
+	lvmcache_del_mdas(info);
+	lvmcache_del_das(info);
 
 	dm_list_init(&pvs);
+
+	pe_count = pv->pe_count;
+	pe_size = pv->pe_size;
+	pe_start = pv->pe_start;
 
 	/* Ensure any residual PE structure is gone */
 	pv->pe_size = pv->pe_count = 0;
@@ -453,6 +437,8 @@ static int _format1_pv_write(const struct format_type *fmt, struct physical_volu
 
 	dl->mem = mem;
 	dl->dev = pv->dev;
+	dm_list_init(&dl->uuids);
+	dm_list_init(&dl->lvds);
 
 	if (!export_pv(fmt->cmd, mem, NULL, &dl->pvd, pv))
 		goto_bad;
@@ -467,12 +453,18 @@ static int _format1_pv_write(const struct format_type *fmt, struct physical_volu
 	if (!write_disks(fmt, &pvs))
 		goto_bad;
 
-	dm_pool_destroy(mem);
-	return 1;
+	goto out;
 
       bad:
+	r = 0;
+
+      out:
+	pv->pe_size = pe_size;
+	pv->pe_count = pe_count;
+	pv->pe_start = pe_start;
+
 	dm_pool_destroy(mem);
-	return 0;
+	return r;
 }
 
 static int _format1_vg_setup(struct format_instance *fid, struct volume_group *vg)
@@ -522,24 +514,19 @@ static struct metadata_area_ops _metadata_format1_ops = {
 };
 
 static struct format_instance *_format1_create_instance(const struct format_type *fmt,
-						const char *vgname __attribute__((unused)),
-						const char *vgid __attribute__((unused)),
-						void *private __attribute__((unused)))
+							const struct format_instance_ctx *fic)
 {
 	struct format_instance *fid;
 	struct metadata_area *mda;
 
-	if (!(fid = dm_pool_alloc(fmt->cmd->mem, sizeof(*fid))))
+	if (!(fid = alloc_fid(fmt, fic)))
 		return_NULL;
-
-	fid->fmt = fmt;
-	dm_list_init(&fid->metadata_areas_in_use);
-	dm_list_init(&fid->metadata_areas_ignored);
 
 	/* Define a NULL metadata area */
-	if (!(mda = dm_pool_zalloc(fmt->cmd->mem, sizeof(*mda)))) {
-		dm_pool_free(fmt->cmd->mem, fid);
-		return_NULL;
+	if (!(mda = dm_pool_zalloc(fid->mem, sizeof(*mda)))) {
+		log_error("Unable to allocate metadata area structure "
+			  "for lvm1 format");
+		goto bad;
 	}
 
 	mda->ops = &_metadata_format1_ops;
@@ -548,19 +535,29 @@ static struct format_instance *_format1_create_instance(const struct format_type
 	dm_list_add(&fid->metadata_areas_in_use, &mda->list);
 
 	return fid;
+
+bad:
+	dm_pool_destroy(fid->mem);
+	return NULL;
 }
 
-static void _format1_destroy_instance(struct format_instance *fid __attribute__((unused)))
+static void _format1_destroy_instance(struct format_instance *fid)
 {
+	if (--fid->ref_count <= 1)
+		dm_pool_destroy(fid->mem);
 }
 
 static void _format1_destroy(struct format_type *fmt)
 {
+	if (fmt->orphan_vg)
+		free_orphan_vg(fmt->orphan_vg);
+
 	dm_free(fmt);
 }
 
 static struct format_handler _format1_ops = {
 	.pv_read = _format1_pv_read,
+	.pv_initialise = _format1_pv_initialise,
 	.pv_setup = _format1_pv_setup,
 	.pv_write = _format1_pv_write,
 	.lv_setup = _format1_lv_setup,
@@ -579,9 +576,13 @@ struct format_type *init_format(struct cmd_context *cmd)
 #endif
 {
 	struct format_type *fmt = dm_malloc(sizeof(*fmt));
+	struct format_instance_ctx fic;
+	struct format_instance *fid;
 
-	if (!fmt)
-		return_NULL;
+	if (!fmt) {
+		log_error("Failed to allocate format1 format type structure.");
+		return NULL;
+	}
 
 	fmt->cmd = cmd;
 	fmt->ops = &_format1_ops;
@@ -592,15 +593,37 @@ struct format_type *init_format(struct cmd_context *cmd)
 			FMT_RESTRICTED_READAHEAD;
 	fmt->private = NULL;
 
+	dm_list_init(&fmt->mda_ops);
+
 	if (!(fmt->labeller = lvm1_labeller_create(fmt))) {
 		log_error("Couldn't create lvm1 label handler.");
+		dm_free(fmt);
 		return NULL;
 	}
 
 	if (!(label_register_handler(FMT_LVM1_NAME, fmt->labeller))) {
 		log_error("Couldn't register lvm1 label handler.");
+		fmt->labeller->ops->destroy(fmt->labeller);
+		dm_free(fmt);
 		return NULL;
 	}
+
+	if (!(fmt->orphan_vg = alloc_vg("format1_orphan", cmd, fmt->orphan_vg_name))) {
+		log_error("Couldn't create lvm1 orphan VG.");
+		dm_free(fmt);
+		return NULL;
+	}
+
+	fic.type = FMT_INSTANCE_AUX_MDAS;
+	fic.context.vg_ref.vg_name = fmt->orphan_vg_name;
+	fic.context.vg_ref.vg_id = NULL;
+
+	if (!(fid = _format1_create_instance(fmt, &fic))) {
+		_format1_destroy(fmt);
+		return_NULL;
+	}
+
+	vg_set_fid(fmt->orphan_vg, fid);
 
 	log_very_verbose("Initialised format: %s", fmt->name);
 

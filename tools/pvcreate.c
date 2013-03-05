@@ -56,6 +56,7 @@ static int pvcreate_restore_params_validate(struct cmd_context *cmd,
 		if (!id_read_format(&pp->id, uuid))
 			return 0;
 		pp->idp = &pp->id;
+		lvmcache_seed_infos_from_lvmetad(cmd); /* need to check for UUID dups */
 	}
 
 	if (arg_count(cmd, restorefile_ARG)) {
@@ -74,10 +75,10 @@ static int pvcreate_restore_params_validate(struct cmd_context *cmd,
 		pp->pe_start = pv_pe_start(existing_pvl->pv);
 		pp->extent_size = pv_pe_size(existing_pvl->pv);
 		pp->extent_count = pv_pe_count(existing_pvl->pv);
-		free_vg(vg);
+		release_vg(vg);
 	}
 
-	if (arg_sign_value(cmd, physicalvolumesize_ARG, 0) == SIGN_MINUS) {
+	if (arg_sign_value(cmd, physicalvolumesize_ARG, SIGN_NONE) == SIGN_MINUS) {
 		log_error("Physical volume size may not be negative");
 		return 0;
 	}
@@ -93,6 +94,7 @@ int pvcreate(struct cmd_context *cmd, int argc, char **argv)
 	int i;
 	int ret = ECMD_PROCESSED;
 	struct pvcreate_params pp;
+	struct physical_volume *pv;
 
 	pvcreate_params_set_defaults(&pp);
 
@@ -109,9 +111,9 @@ int pvcreate(struct cmd_context *cmd, int argc, char **argv)
 			return ECMD_FAILED;
 		}
 
-		unescape_colons_and_at_signs(argv[i], NULL, NULL);
+		dm_unescape_colons_and_at_signs(argv[i], NULL, NULL);
 
-		if (!pvcreate_single(cmd, argv[i], &pp)) {
+		if (!(pv = pvcreate_single(cmd, argv[i], &pp, 1))) {
 			stack;
 			ret = ECMD_FAILED;
 		}

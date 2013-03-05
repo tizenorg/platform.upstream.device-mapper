@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2002-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2011 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -51,19 +51,16 @@
 */
 
 #include "clvmd-common.h"
-
-#include <pthread.h>
-
 #include "clvmd-comms.h"
 #include "clvm.h"
 #include "clvmd.h"
+#include "lvm-globals.h"
 #include "lvm-functions.h"
 
 #include "locking.h"
 
 #include <sys/utsname.h>
 
-extern debug_t debug;
 extern struct cluster_ops *clops;
 static int restart_clvmd(void);
 
@@ -81,6 +78,9 @@ int do_command(struct local_client *client, struct clvm_header *msg, int msglen,
 	unsigned char lock_cmd;
 	unsigned char lock_flags;
 
+	/* Reset test mode before we start */
+	init_test(0);
+
 	/* Do the command */
 	switch (msg->cmd) {
 		/* Just a test message */
@@ -96,7 +96,9 @@ int do_command(struct local_client *client, struct clvm_header *msg, int msglen,
 			*buf = new_buf;
 		}
 		if (*buf) {
-			uname(&nodeinfo);
+			if (uname(&nodeinfo))
+				memset(&nodeinfo, 0, sizeof(nodeinfo));
+
 			*retlen = 1 + dm_snprintf(*buf, buflen,
 						  "TEST from %s: %s v%s",
 						  nodeinfo.nodename, args,
@@ -110,14 +112,18 @@ int do_command(struct local_client *client, struct clvm_header *msg, int msglen,
 		lockname = &args[2];
 		/* Check to see if the VG is in use by LVM1 */
 		status = do_check_lvm1(lockname);
+		if (lock_flags & LCK_TEST_MODE)
+			init_test(1);
 		do_lock_vg(lock_cmd, lock_flags, lockname);
 		break;
 
 	case CLVMD_CMD_LOCK_LV:
 		/* This is the biggie */
-		lock_cmd = args[0] & (LCK_NONBLOCK | LCK_HOLD | LCK_SCOPE_MASK | LCK_TYPE_MASK);
+		lock_cmd = args[0];
 		lock_flags = args[1];
 		lockname = &args[2];
+		if (lock_flags & LCK_TEST_MODE)
+			init_test(1);
 		status = do_lock_lv(lock_cmd, lock_flags, lockname);
 		/* Replace EIO with something less scary */
 		if (status == EIO) {
@@ -139,12 +145,16 @@ int do_command(struct local_client *client, struct clvm_header *msg, int msglen,
 		do_refresh_cache();
 		break;
 
+	case CLVMD_CMD_SYNC_NAMES:
+		lvm_do_fs_unlock();
+		break;
+
 	case CLVMD_CMD_SET_DEBUG:
-		debug = args[0];
+		clvmd_set_debug((debug_t) args[0]);
 		break;
 
 	case CLVMD_CMD_RESTART:
-		restart_clvmd();
+		status = restart_clvmd();
 		break;
 
 	case CLVMD_CMD_GET_CLUSTERNAME:
@@ -182,7 +192,6 @@ static int lock_vg(struct local_client *client)
     struct clvm_header *header =
 	(struct clvm_header *) client->bits.localsock.cmd;
     unsigned char lock_cmd;
-    unsigned char lock_flags;
     int lock_mode;
     char *args = header->node + strlen(header->node) + 1;
     int lkid;
@@ -204,7 +213,7 @@ static int lock_vg(struct local_client *client)
 
     lock_cmd = args[0] & (LCK_NONBLOCK | LCK_HOLD | LCK_SCOPE_MASK | LCK_TYPE_MASK);
     lock_mode = ((int)lock_cmd & LCK_TYPE_MASK);
-    lock_flags = args[1];
+    /* lock_flags = args[1]; */
     lockname = &args[2];
     DEBUGLOG("doing PRE command LOCK_VG '%s' at %x (client=%p)\n", lockname, lock_cmd, client);
 
@@ -228,7 +237,8 @@ static int lock_vg(struct local_client *client)
 	if (status)
 	    status = errno;
 	else
-	    dm_hash_insert(lock_hash, lockname, (void *)(long)lkid);
+	    if (!dm_hash_insert(lock_hash, lockname, (void *)(long)lkid))
+                    return ENOMEM;
     }
 
     return status;
@@ -245,10 +255,11 @@ int do_pre_command(struct local_client *client)
 	unsigned char lock_cmd;
 	unsigned char lock_flags;
 	char *args = header->node + strlen(header->node) + 1;
-	int lockid;
+	int lockid = 0;
 	int status = 0;
 	char *lockname;
 
+	init_test(0);
 	switch (header->cmd) {
 	case CLVMD_CMD_TEST:
 		status = sync_lock("CLVMD_TEST", LCK_EXCL, 0, &lockid);
@@ -267,6 +278,8 @@ int do_pre_command(struct local_client *client)
 		lock_cmd = args[0];
 		lock_flags = args[1];
 		lockname = &args[2];
+		if (lock_flags & LCK_TEST_MODE)
+			init_test(1);
 		status = pre_lock_lv(lock_cmd, lock_flags, lockname);
 		break;
 
@@ -274,6 +287,7 @@ int do_pre_command(struct local_client *client)
 	case CLVMD_CMD_GET_CLUSTERNAME:
 	case CLVMD_CMD_SET_DEBUG:
 	case CLVMD_CMD_VG_BACKUP:
+	case CLVMD_CMD_SYNC_NAMES:
 	case CLVMD_CMD_LOCK_QUERY:
 	case CLVMD_CMD_RESTART:
 		break;
@@ -297,6 +311,7 @@ int do_post_command(struct local_client *client)
 	char *args = header->node + strlen(header->node) + 1;
 	char *lockname;
 
+	init_test(0);
 	switch (header->cmd) {
 	case CLVMD_CMD_TEST:
 		status =
@@ -304,17 +319,17 @@ int do_post_command(struct local_client *client)
 		client->bits.localsock.private = 0;
 		break;
 
-	case CLVMD_CMD_LOCK_VG:
-	case CLVMD_CMD_VG_BACKUP:
-	case CLVMD_CMD_LOCK_QUERY:
-		/* Nothing to do here */
-		break;
-
 	case CLVMD_CMD_LOCK_LV:
 		lock_cmd = args[0];
 		lock_flags = args[1];
 		lockname = &args[2];
+		if (lock_flags & LCK_TEST_MODE)
+			init_test(1);
 		status = post_lock_lv(lock_cmd, lock_flags, lockname);
+		break;
+
+	default:
+		/* Nothing to do here */
 		break;
 	}
 	return status;
@@ -324,90 +339,93 @@ int do_post_command(struct local_client *client)
 /* Called when the client is about to be deleted */
 void cmd_client_cleanup(struct local_client *client)
 {
-    if (client->bits.localsock.private) {
-
 	struct dm_hash_node *v;
-	struct dm_hash_table *lock_hash =
-	    (struct dm_hash_table *)client->bits.localsock.private;
+	struct dm_hash_table *lock_hash;
+	int lkid;
+	char *lockname;
+
+	if (!client->bits.localsock.private)
+		return;
+
+	lock_hash = (struct dm_hash_table *)client->bits.localsock.private;
 
 	dm_hash_iterate(v, lock_hash) {
-		int lkid = (int)(long)dm_hash_get_data(lock_hash, v);
-		char *lockname = dm_hash_get_key(lock_hash, v);
-
+		lkid = (int)(long)dm_hash_get_data(lock_hash, v);
+		lockname = dm_hash_get_key(lock_hash, v);
 		DEBUGLOG("cleanup: Unlocking lock %s %x\n", lockname, lkid);
-		sync_unlock(lockname, lkid);
+		(void) sync_unlock(lockname, lkid);
 	}
 
 	dm_hash_destroy(lock_hash);
 	client->bits.localsock.private = 0;
-    }
 }
 
 
 static int restart_clvmd(void)
 {
-	char **argv = NULL;
-	char *debug_arg = NULL, *lv_name;
-	int i, argc = 0, max_locks = 0;
+	const char **argv;
+	char *lv_name;
+	int argc = 0, max_locks = 0;
 	struct dm_hash_node *hn = NULL;
+	char debug_arg[16];
+	const char *clvmd = getenv("LVM_CLVMD_BINARY") ? : CLVMD_PATH;
 
 	DEBUGLOG("clvmd restart requested\n");
 
 	/* Count exclusively-open LVs */
-	hn = NULL;
 	do {
 		hn = get_next_excl_lock(hn, &lv_name);
-		if (lv_name)
+		if (lv_name) {
 			max_locks++;
-	} while (hn && *lv_name);
+			if (!*lv_name)
+				break; /* FIXME: Is this error ? */
+		}
+	} while (hn);
 
 	/* clvmd + locks (-E uuid) + debug (-d X) + NULL */
-	argv = malloc((max_locks * 2 + 4) * sizeof(*argv));
-	if (!argv)
+	if (!(argv = malloc((max_locks * 2 + 5) * sizeof(*argv))))
 		goto_out;
 
 	/*
 	 * Build the command-line
 	 */
-	argv[argc++] = strdup("clvmd");
-	if (!argv[0])
-		goto_out;
+	argv[argc++] = "clvmd";
 
 	/* Propogate debug options */
-	if (debug) {
-		if (!(debug_arg = malloc(16)) ||
-		    dm_snprintf(debug_arg, 16, "-d%d", (int)debug) < 0)
+	if (clvmd_get_debug()) {
+		if (dm_snprintf(debug_arg, sizeof(debug_arg), "-d%u", clvmd_get_debug()) < 0)
 			goto_out;
 		argv[argc++] = debug_arg;
 	}
 
+	argv[argc++] = "-I";
+	argv[argc++] = clops->name;
+
 	/* Now add the exclusively-open LVs */
+	hn = NULL;
 	do {
 		hn = get_next_excl_lock(hn, &lv_name);
 		if (lv_name) {
-			argv[argc] = strdup("-E");
-			if (!argv[argc++])
-				goto_out;
-			argv[argc] = strdup(lv_name);
-			if (!argv[argc++])
-				goto_out;
-
+			if (!*lv_name)
+				break; /* FIXME: Is this error ? */
+			argv[argc++] = "-E";
+			argv[argc++] = lv_name;
 			DEBUGLOG("excl lock: %s\n", lv_name);
-			hn = get_next_excl_lock(hn, &lv_name);
 		}
-	} while (hn && *lv_name);
-	argv[argc++] = NULL;
+	} while (hn);
+	argv[argc] = NULL;
 
 	/* Exec new clvmd */
+	DEBUGLOG("--- Restarting %s ---\n", clvmd);
+	for (argc = 1; argv[argc]; argc++) DEBUGLOG("--- %d: %s\n", argc, argv[argc]);
+
 	/* NOTE: This will fail when downgrading! */
-	execve(CLVMD_PATH, argv, NULL);
+	execvp(clvmd, (char **)argv);
 out:
 	/* We failed */
 	DEBUGLOG("Restart of clvmd failed.\n");
 
-	for (i = 0; i < argc && argv[i]; i++)
-		free(argv[i]);
 	free(argv);
 
-	return 0;
+	return EIO;
 }

@@ -40,7 +40,7 @@ static int _restore_pv(struct volume_group *vg, char *pv_name)
 
 int vgextend(struct cmd_context *cmd, int argc, char **argv)
 {
-	char *vg_name;
+	const char *vg_name;
 	struct volume_group *vg = NULL;
 	int r = ECMD_FAILED;
 	struct pvcreate_params pp;
@@ -66,13 +66,18 @@ int vgextend(struct cmd_context *cmd, int argc, char **argv)
 		return EINVALID_CMD_LINE;
 	}
 
-	if (arg_count(cmd, restoremissing_ARG))
-		cmd->handles_missing_pvs = 1;
+	/*
+	 * It is always ok to add new PVs to a VG - even if there are
+	 * missing PVs.  No LVs are affected by this operation, but
+	 * repair processes - particularly for RAID segtypes - can
+	 * be facilitated.
+	 */
+	cmd->handles_missing_pvs = 1;
 
 	log_verbose("Checking for volume group \"%s\"", vg_name);
 	vg = vg_read_for_update(cmd, vg_name, NULL, 0);
 	if (vg_read_error(vg)) {
-		free_vg(vg);
+		release_vg(vg);
 		stack;
 		return ECMD_FAILED;
 	}
@@ -92,7 +97,7 @@ int vgextend(struct cmd_context *cmd, int argc, char **argv)
 	} else { /* no --restore, normal vgextend */
 		if (!lock_vol(cmd, VG_ORPHANS, LCK_VG_WRITE)) {
 			log_error("Can't get lock for orphan PVs");
-			unlock_and_free_vg(cmd, vg, vg_name);
+			unlock_and_release_vg(cmd, vg, vg_name);
 			return ECMD_FAILED;
 		}
 
@@ -107,7 +112,7 @@ int vgextend(struct cmd_context *cmd, int argc, char **argv)
 		}
 
 		/* extend vg */
-		if (!vg_extend(vg, argc, argv, &pp))
+		if (!vg_extend(vg, argc, (const char* const*)argv, &pp))
 			goto_bad;
 
 		if (arg_count(cmd, metadataignore_ARG) &&
@@ -129,12 +134,12 @@ int vgextend(struct cmd_context *cmd, int argc, char **argv)
 		goto_bad;
 
 	backup(vg);
-	log_print("Volume group \"%s\" successfully extended", vg_name);
+	log_print_unless_silent("Volume group \"%s\" successfully extended", vg_name);
 	r = ECMD_PROCESSED;
 
 bad:
 	if (!arg_count(cmd, restoremissing_ARG))
 		unlock_vg(cmd, VG_ORPHANS);
-	unlock_and_free_vg(cmd, vg, vg_name);
+	unlock_and_release_vg(cmd, vg, vg_name);
 	return r;
 }

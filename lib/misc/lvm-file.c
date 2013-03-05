@@ -15,7 +15,6 @@
 
 #include "lib.h"
 #include "lvm-file.h"
-#include "lvm-string.h"
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -35,6 +34,7 @@ int create_temp_name(const char *dir, char *buffer, size_t len, int *fd,
 	int i, num;
 	pid_t pid;
 	char hostname[255];
+	char *p;
 	struct flock lock = {
 		.l_type = F_WRLCK,
 		.l_whence = 0,
@@ -47,6 +47,12 @@ int create_temp_name(const char *dir, char *buffer, size_t len, int *fd,
 	if (gethostname(hostname, sizeof(hostname)) < 0) {
 		log_sys_error("gethostname", "");
 		strcpy(hostname, "nohostname");
+	}
+	else {
+		/* Replace any '/' with '?' found in the hostname. */
+		p = hostname;
+		while ((p = strchr(p, '/')))
+			*p = '?';
 	}
 
 	for (i = 0; i < 20; i++, num++) {
@@ -246,7 +252,8 @@ int fcntl_lock_file(const char *file, short lock_type, int warn_if_read_only)
 
 	if (fcntl(lockfd, F_SETLKW, &lock)) {
 		log_sys_error("fcntl", file);
-		close(lockfd);
+		if (close(lockfd))
+                        log_sys_error("close", file);
 		return -1;
 	}
 

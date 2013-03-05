@@ -25,6 +25,7 @@ SOURCES =\
 	libdm-deptree.c \
 	libdm-string.c \
 	libdm-report.c \
+	libdm-config.c \
 	mm/dbg_malloc.c \
 	mm/pool.c \
 	regex/matcher.c \
@@ -33,6 +34,9 @@ SOURCES =\
 	$(interface)/libdm-iface.c
 
 INCLUDES = -I$(srcdir)/$(interface) -I$(srcdir)
+ifeq ("@VALGRIND_POOL@", "yes")
+INCLUDES += @VALGRIND_CFLAGS@
+endif
 
 ifeq ("@STATIC_LINK@", "yes")
 LIB_STATIC = $(interface)/libdevmapper.a

@@ -1,4 +1,4 @@
-# Copyright (C) 2007-2010 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2007-2012 Red Hat, Inc. All rights reserved.
 #
 # This file is part of LVM2.
 #
@@ -12,119 +12,130 @@
 
 #TEST_OPTS=--verbose --debug
 SHELL_PATH ?= $(SHELL)
-TAR ?= $(TAR)
 RM ?= rm -f
 
-subdir := $(shell pwd|sed 's,.*/,,')
+subdir = $(shell pwd|sed 's,.*/,,')
 
 srcdir = @srcdir@
 top_srcdir = @top_srcdir@
 top_builddir = @top_builddir@
-abs_srcdir = @abs_srcdir@
-abs_builddir = @abs_builddir@
-abs_top_builddir = @abs_top_builddir@
-abs_top_srcdir = @abs_top_srcdir@
+abs_srcdir = "@abs_srcdir@"
+abs_builddir = "@abs_builddir@"
+abs_top_builddir = "@abs_top_builddir@"
+abs_top_srcdir = "@abs_top_srcdir@"
+
+SUBDIRS = api unit
+SOURCES = lib/not.c lib/harness.c
+
+include $(top_builddir)/make.tmpl
 
 T ?= .
 S ?= @ # never match anything by default
 VERBOSE ?= 0
-RUN = $(shell find $(srcdir) -regextype posix-egrep \( -name t-\*.sh -or -path */api/\*.sh \) -and -regex "$(srcdir)/.*($(T)).*" -and -not -regex "$(srcdir)/.*($(S)).*" | sort)
-RUN_BASE = $(shell echo $(RUN) | xargs -n 1 echo | sed -e s,^$(srcdir)/,,)
+ALL = $(shell find $(srcdir) \( -path \*/shell/\*.sh -or -path \*/api/\*.sh \) | sort)
+RUN = $(shell find $(srcdir) -regextype posix-egrep \( -path \*/shell/\*.sh -or -path \*/api/\*.sh \) -and -regex "$(srcdir)/.*($(T)).*" -and -not -regex "$(srcdir)/.*($(S)).*" | sort)
+RUN_BASE = $(subst $(srcdir)/,,$(RUN))
 
 # Shell quote;
 SHELL_PATH_SQ = $(subst ','\'',$(SHELL_PATH))
-
-SUPPORT := $(srcdir)/test-utils.sh \
-           $(srcdir)/lvm-utils.sh
 
 ifeq ("@UDEV_SYNC@", "yes")
 dm_udev_synchronisation = 1
 endif
 
-all check: init.sh
-	make -C api tests
-	@echo Testing with locking_type 1
-	VERBOSE=$(VERBOSE) ./bin/harness $(RUN_BASE)
+all: check
+
+help:
+	@echo -e "\nAvailable targets:"
+	@echo "  all			Default target, run check."
+	@echo "  check			Run all tests."
+	@echo "  check_local		Run tests without clvmd and lvmetad."
+	@echo "  check_cluster		Run tests with cluster daemon."
+	@echo "  check_lvmetad		Run tests with lvmetad daemon."
+	@echo "  clean			Clean dir."
+	@echo "  help			Display callable targets."
+	@echo -e "\nSupported variables:"
+	@echo "  LVM_TEST_DEVDIR	Set to '/dev' to run on real /dev."
+	@echo "  LVM_TEST_DIR		Where to create test files [TMPDIR]."
+	@echo "  LVM_TEST_LOCKING	Normal (1), Cluster (3)."
+	@echo "  LVM_TEST_LVMETAD	Start lvmetad (1)."
+	@echo "  LVM_TEST_NODEBUG	Do not debug lvm commands."
+	@echo "  LVM_TEST_PARALLEL	May skip agresive wipe of LVMTEST resources."
+	@echo "  LVM_VERIFY_UDEV	Default verify state for lvm.conf."
+	@echo "  S			Skip given test (regex)."
+	@echo "  T			Run given test (regex)."
+	@echo "  VERBOSE		Verbose output (1), timing (2)."
+
+check: check_local check_cluster check_lvmetad
+
+check_cluster: .tests-stamp
 	@echo Testing with locking_type 3
-	VERBOSE=$(VERBOSE) LVM_TEST_LOCKING=3 ./bin/harness $(RUN_BASE)
+	VERBOSE=$(VERBOSE) LVM_TEST_LOCKING=3 ./lib/harness $(RUN_BASE)
 
-check_cluster: init.sh
-	make -C api tests
-	@echo Testing with locking_type 3
-	VERBOSE=$(VERBOSE) LVM_TEST_LOCKING=3 ./bin/harness $(RUN_BASE)
-
-check_local: init.sh
-	make -C api tests
+check_local: .tests-stamp
 	@echo Testing with locking_type 1
-	VERBOSE=$(VERBOSE) LVM_TEST_LOCKING=1 ./bin/harness $(RUN_BASE)
+	VERBOSE=$(VERBOSE) LVM_TEST_LOCKING=1 ./lib/harness $(RUN_BASE)
 
-bin/not: $(srcdir)/not.c .bin-dir-stamp
-	$(CC) -o bin/not $<
-	ln -sf not bin/should
+check_lvmetad: .tests-stamp
+	@echo Testing with lvmetad on
+	VERBOSE=$(VERBOSE) LVM_TEST_LVMETAD=1 ./lib/harness $(RUN_BASE)
 
-bin/harness: $(srcdir)/harness.c .bin-dir-stamp
-	$(CC) -o bin/harness $<
+lib/should: lib/not
+	ln -sf not lib/should
 
-bin/check: $(srcdir)/check.sh .bin-dir-stamp
-	cp $< bin/check
-	chmod +x bin/check
+lib/%: lib/%.o .lib-dir-stamp
+	$(CC) $(LDFLAGS) -o $@ $<
 
-init.sh: $(srcdir)/Makefile.in .bin-dir-stamp bin/not bin/check bin/harness $(RUN) $(SUPPORT) $(UNIT)
-	rm -f $@-t $@
+lib/%: $(srcdir)/lib/%.sh .lib-dir-stamp
+	cp $< $@
+	chmod +x $@
+
+lib/paths: $(srcdir)/Makefile.in .lib-dir-stamp
+	$(RM) $@-t
 	echo 'top_srcdir=$(top_srcdir)' >> $@-t
 	echo 'abs_top_builddir=$(abs_top_builddir)' >> $@-t
-	echo 'abs_top_srcdir=$(abs_top_builddir)' >> $@-t
-	echo 'PATH=$$abs_top_builddir/test/bin:$$PATH' >> $@-t
-	LDLPATH="\$$abs_top_builddir/libdm"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/tools"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/liblvm"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/daemons/dmeventd"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/daemons/dmeventd/plugins/lvm2"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/daemons/dmeventd/plugins/mirror"; \
-	LDLPATH="$$LDLPATH:\$$abs_top_builddir/daemons/dmeventd/plugins/snapshot"; \
-	echo "export LD_LIBRARY_PATH=\"$$LDLPATH\"" >> $@-t
-	echo 'top_srcdir=$(top_srcdir)' >> $@-t
+	echo 'abs_top_srcdir=$(abs_top_srcdir)' >> $@-t
 	echo 'abs_srcdir=$(abs_srcdir)' >> $@-t
 	echo 'abs_builddir=$(abs_builddir)' >> $@-t
-	echo 'export PATH' >> $@-t
 	echo 'export DM_UDEV_SYNCHRONISATION=$(dm_udev_synchronisation)' >> $@-t
-	chmod a-w $@-t
+	echo 'export THIN=@THIN@' >> $@-t
+	echo 'export LVMETAD_PIDFILE=@LVMETAD_PIDFILE@' >> $@-t
 	mv $@-t $@
+
+LIB = lib/not lib/should lib/harness \
+      lib/check lib/aux lib/test lib/utils lib/get lib/lvm-wrapper \
+      lib/paths
+
+CMDS = lvm $(shell cat $(top_builddir)/tools/.commands)
+
+.tests-stamp: $(ALL) $(LIB) $(SUBDIRS)
 	@if test "$(srcdir)" != . ; then \
-	    echo "Copying tests to builddir."; \
-	    cp $(SUPPORT) .; \
-	    for f in $(RUN); do cp $$f `echo $$f | sed -e s,^$(srcdir)/,,`; done; \
+		echo "Linking tests to builddir."; \
+		$(MKDIR_P) shell; \
+		for f in $(subst $(srcdir)/,,$(ALL)); do \
+			ln -sf $(abs_top_srcdir)/test/$$f $$f; \
+		done; \
 	fi
+	touch $@
+
+.lib-dir-stamp:
+	$(MKDIR_P) lib
+	for i in $(CMDS); do ln -fs lvm-wrapper lib/$$i; done
+	ln -fs $(abs_top_builddir)/tools/dmsetup lib/dmsetup
+	ln -fs $(abs_top_builddir)/daemons/clvmd/clvmd lib/clvmd
+	ln -fs $(abs_top_builddir)/daemons/dmeventd/dmeventd lib/dmeventd
+	ln -fs $(abs_top_builddir)/daemons/lvmetad/lvmetad lib/lvmetad
+	ln -fs $(abs_top_srcdir)/scripts/vgimportclone.sh lib/vgimportclone
+	ln -fs $(abs_top_srcdir)/scripts/fsadm.sh lib/fsadm
+	touch $@
+
+clean:
+	test "$(srcdir)" = . || $(RM) $(RUN_BASE)
+
+CLEAN_TARGETS += .lib-dir-stamp .tests-stamp $(LIB) $(addprefix lib/,$(CMDS)) \
+	lib/clvmd lib/dmeventd lib/dmsetup lib/lvmetad lib/fsadm lib/vgimportclone
 
 Makefile: $(srcdir)/Makefile.in $(top_builddir)/config.status
 	cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@
-
-.bin-dir-stamp: lvm-wrapper
-	rm -rf bin
-	mkdir bin
-	for i in lvm $$(cat ../tools/.commands); do \
-	  ln -s ../lvm-wrapper bin/$$i; \
-	done
-	ln -s "$(abs_top_builddir)/tools/dmsetup" bin/dmsetup
-	ln -s "$(abs_top_builddir)/daemons/clvmd/clvmd" bin/clvmd
-	ln -s "$(abs_top_builddir)/daemons/dmeventd/dmeventd" bin/dmeventd
-	touch $@
-
-lvm-wrapper: Makefile
-	rm -f $@-t $@
-	echo '#!/bin/sh'                                          >  $@-t
-	echo 'cmd=$$(echo ./$$0|sed "s,.*/,,")'                   >> $@-t
-	echo 'test "$$cmd" = lvm &&'                              >> $@-t
-	echo 'exec "$(abs_top_builddir)/tools/lvm" "$$@"'         >> $@-t
-	echo 'exec "$(abs_top_builddir)/tools/lvm" "$$cmd" "$$@"' >> $@-t
-	chmod a-w,a+x $@-t
-	mv $@-t $@
-
-clean:
-	rm -rf init.sh lvm-wrapper bin .bin-dir-stamp
-	if test "$(srcdir)" != . ; then rm -f $(subst $(srcdir)/, ,$(RUN)) lvm2app.sh ; fi
-
-distclean: clean
-	rm -f Makefile
 
 .NOTPARALLEL:

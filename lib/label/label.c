@@ -18,6 +18,7 @@
 #include "crc.h"
 #include "xlate.h"
 #include "lvmcache.h"
+#include "lvmetad.h"
 #include "metadata.h"
 
 #include <sys/stat.h>
@@ -56,11 +57,6 @@ static struct labeller_i *_alloc_li(const char *name, struct labeller *l)
 	return li;
 }
 
-static void _free_li(struct labeller_i *li)
-{
-	dm_free(li);
-}
-
 int label_init(void)
 {
 	dm_list_init(&_labellers);
@@ -69,14 +65,12 @@ int label_init(void)
 
 void label_exit(void)
 {
-	struct dm_list *c, *n;
-	struct labeller_i *li;
+	struct labeller_i *li, *tli;
 
-	for (c = _labellers.n; c && c != &_labellers; c = n) {
-		n = c->n;
-		li = dm_list_item(c, struct labeller_i);
+	dm_list_iterate_items_safe(li, tli, &_labellers) {
+		dm_list_del(&li->list);
 		li->l->ops->destroy(li->l);
-		_free_li(li);
+		dm_free(li);
 	}
 
 	dm_list_init(&_labellers);
@@ -156,8 +150,10 @@ static struct labeller *_find_labeller(struct device *dev, char *buf,
 		dm_list_iterate_items(li, &_labellers) {
 			if (li->l->ops->can_handle(li->l, (char *) lh,
 						   sector + scan_sector)) {
-				log_very_verbose("%s: %s label detected",
-						 dev_name(dev), li->name);
+				log_very_verbose("%s: %s label detected at "
+					         "sector %" PRIu64, 
+						 dev_name(dev), li->name,
+						 sector + scan_sector);
 				if (found) {
 					log_error("Ignoring additional label "
 						  "on %s at sector %" PRIu64,
@@ -177,9 +173,9 @@ static struct labeller *_find_labeller(struct device *dev, char *buf,
 
       out:
 	if (!found) {
-		if ((info = info_from_pvid(dev->pvid, 0)))
-			lvmcache_update_vgname_and_id(info, info->fmt->orphan_vg_name,
-						      info->fmt->orphan_vg_name,
+		if ((info = lvmcache_info_from_pvid(dev->pvid, 0)))
+			lvmcache_update_vgname_and_id(info, lvmcache_fmt(info)->orphan_vg_name,
+						      lvmcache_fmt(info)->orphan_vg_name,
 						      0, NULL);
 		log_very_verbose("%s: No label detected", dev_name(dev));
 	}
@@ -266,18 +262,18 @@ int label_read(struct device *dev, struct label **result,
 	struct lvmcache_info *info;
 	int r = 0;
 
-	if ((info = info_from_pvid(dev->pvid, 1))) {
+	if ((info = lvmcache_info_from_pvid(dev->pvid, 1))) {
 		log_debug("Using cached label for %s", dev_name(dev));
-		*result = info->label;
+		*result = lvmcache_get_label(info);
 		return 1;
 	}
 
-	if (!dev_open(dev)) {
+	if (!dev_open_readonly(dev)) {
 		stack;
 
-		if ((info = info_from_pvid(dev->pvid, 0)))
-			lvmcache_update_vgname_and_id(info, info->fmt->orphan_vg_name,
-						      info->fmt->orphan_vg_name,
+		if ((info = lvmcache_info_from_pvid(dev->pvid, 0)))
+			lvmcache_update_vgname_and_id(info, lvmcache_fmt(info)->orphan_vg_name,
+						      lvmcache_fmt(info)->orphan_vg_name,
 						      0, NULL);
 
 		return r;
@@ -352,10 +348,10 @@ int label_verify(struct device *dev)
 	struct lvmcache_info *info;
 	int r = 0;
 
-	if (!dev_open(dev)) {
-		if ((info = info_from_pvid(dev->pvid, 0)))
-			lvmcache_update_vgname_and_id(info, info->fmt->orphan_vg_name,
-						      info->fmt->orphan_vg_name,
+	if (!dev_open_readonly(dev)) {
+		if ((info = lvmcache_info_from_pvid(dev->pvid, 0)))
+			lvmcache_update_vgname_and_id(info, lvmcache_fmt(info)->orphan_vg_name,
+						      lvmcache_fmt(info)->orphan_vg_name,
 						      0, NULL);
 
 		return_0;

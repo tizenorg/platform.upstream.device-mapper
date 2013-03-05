@@ -27,6 +27,11 @@ static int _create_dir_recursive(const char *dir)
 	log_verbose("Creating directory \"%s\"", dir);
 	/* Create parent directories */
 	orig = s = dm_strdup(dir);
+	if (!s) {
+		log_error("Failed to duplicate directory name.");
+		return 0;
+	}
+
 	while ((s = strchr(s, '/')) != NULL) {
 		*s = '\0';
 		if (*orig) {
@@ -71,6 +76,26 @@ int dm_create_dir(const char *dir)
 	return 0;
 }
 
+int dm_is_empty_dir(const char *dir)
+{
+	struct dirent *dirent;
+	DIR *d;
+
+	if (!(d = opendir(dir))) {
+		log_sys_error("opendir", dir);
+		return 0;
+	}
+
+	while ((dirent = readdir(d)))
+		if (strcmp(dirent->d_name, ".") && strcmp(dirent->d_name, ".."))
+			break;
+
+	if (closedir(d))
+		log_sys_error("closedir", dir);
+
+	return dirent ? 0 : 1;
+}
+
 int dm_fclose(FILE *stream)
 {
 	int prev_fail = ferror(stream);
@@ -110,7 +135,6 @@ retry_fcntl:
 		switch (errno) {
 		case EINTR:
 			goto retry_fcntl;
-			break;
 		case EACCES:
 		case EAGAIN:
 			if (retries == 20) {
@@ -149,7 +173,7 @@ retry_fcntl:
 		goto fail_close_unlink;
 	}
 
-	if ((write_out == 0) || (write_out < bufferlen)) {
+	if ((write_out == 0) || ((size_t)write_out < bufferlen)) {
 		log_error("Cannot write pid to pidfile [%s], shortwrite of"
 			  "[%" PRIsize_t "] bytes, expected [%" PRIsize_t "]\n",
 			  lockfile, write_out, bufferlen);

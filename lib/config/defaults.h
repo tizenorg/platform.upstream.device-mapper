@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2009 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2012 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -29,14 +29,18 @@
 
 #define DEFAULT_DEV_DIR "/dev"
 #define DEFAULT_PROC_DIR "/proc"
+#define DEFAULT_OBTAIN_DEVICE_LIST_FROM_UDEV 1
 #define DEFAULT_SYSFS_SCAN 1
 #define DEFAULT_MD_COMPONENT_DETECTION 1
 #define DEFAULT_MD_CHUNK_ALIGNMENT 1
+#define DEFAULT_MULTIPATH_COMPONENT_DETECTION 1
 #define DEFAULT_IGNORE_SUSPENDED_DEVICES 1
 #define DEFAULT_DISABLE_AFTER_ERROR_COUNT 0
 #define DEFAULT_REQUIRE_RESTOREFILE_WITH_UUID 1
 #define DEFAULT_DATA_ALIGNMENT_OFFSET_DETECTION 1
 #define DEFAULT_DATA_ALIGNMENT_DETECTION 1
+#define DEFAULT_ISSUE_DISCARDS 0
+#define DEFAULT_PV_MIN_SIZE_KB 2048
 
 #define DEFAULT_LOCKING_LIB "liblvm2clusterlock.so"
 #define DEFAULT_FALLBACK_TO_LOCAL_LOCKING 1
@@ -45,15 +49,26 @@
 #define DEFAULT_PRIORITISE_WRITE_LOCKS 1
 #define DEFAULT_USE_MLOCKALL 0
 #define DEFAULT_METADATA_READ_ONLY 0
+#define DEFAULT_LVDISPLAY_SHOWS_FULL_DEVICE_PATH 0
 
+#define DEFAULT_MIRROR_SEGTYPE "mirror"
 #define DEFAULT_MIRRORLOG "disk"
 #define DEFAULT_MIRROR_LOG_FAULT_POLICY "allocate"
 #define DEFAULT_MIRROR_IMAGE_FAULT_POLICY "remove"
 #define DEFAULT_MIRROR_MAX_IMAGES 8 /* limited by kernel DM_KCOPYD_MAX_REGIONS */
+#define DEFAULT_RAID_FAULT_POLICY "warn"
+#define DEFAULT_DMEVENTD_RAID_LIB "libdevmapper-event-lvm2raid.so"
 #define DEFAULT_DMEVENTD_MIRROR_LIB "libdevmapper-event-lvm2mirror.so"
 #define DEFAULT_DMEVENTD_SNAPSHOT_LIB "libdevmapper-event-lvm2snapshot.so"
+#define DEFAULT_DMEVENTD_THIN_LIB "libdevmapper-event-lvm2thin.so"
 #define DEFAULT_DMEVENTD_MONITOR 1
 #define DEFAULT_BACKGROUND_POLLING 1
+
+#define DEFAULT_THIN_CHECK_OPTIONS "-q"
+#define DEFAULT_THIN_POOL_METADATA_REQUIRE_SEPARATE_PVS 0
+#define DEFAULT_THIN_POOL_MAX_METADATA_SIZE (16 * 1024 * 1024)  /* KB */
+#define DEFAULT_THIN_POOL_MIN_METADATA_SIZE 2048  /* KB */
+#define DEFAULT_THIN_POOL_OPTIMAL_SIZE     (128 * 1024 * 1024)	/* KB */
 
 #define DEFAULT_UMASK 0077
 
@@ -74,11 +89,16 @@
 #define DEFAULT_LABELSECTOR UINT64_C(1)
 #define DEFAULT_READ_AHEAD "auto"
 #define DEFAULT_UDEV_RULES 1
-#define DEFAULT_UDEV_SYNC 0
+#define DEFAULT_UDEV_SYNC 1
+#define DEFAULT_VERIFY_UDEV_OPERATIONS 0
+#define DEFAULT_RETRY_DEACTIVATION 1
+#define DEFAULT_ACTIVATION_CHECKS 0
 #define DEFAULT_EXTENT_SIZE 4096	/* In KB */
 #define DEFAULT_MAX_PV 0
 #define DEFAULT_MAX_LV 0
 #define DEFAULT_ALLOC_POLICY ALLOC_NORMAL
+#define DEFAULT_MIRROR_LOGS_REQUIRE_SEPARATE_PVS 0
+#define DEFAULT_MAXIMISE_CLING 1
 #define DEFAULT_CLUSTERED 0
 
 #define DEFAULT_MSG_PREFIX "  "
@@ -91,9 +111,11 @@
 
 #define DEFAULT_SYSLOG 1
 #define DEFAULT_VERBOSE 0
+#define DEFAULT_SILENT 0
 #define DEFAULT_LOGLEVEL 0
 #define DEFAULT_INDENT 1
 #define DEFAULT_ABORT_ON_INTERNAL_ERRORS 0
+#define DEFAULT_DETECT_INTERNAL_VG_CACHE_CORRUPTION 0
 #define DEFAULT_UNITS "h"
 #define DEFAULT_SUFFIX 1
 #define DEFAULT_HOSTTAGS 0
@@ -105,12 +127,13 @@
 #ifdef DEVMAPPER_SUPPORT
 #  define DEFAULT_ACTIVATION 1
 #  define DEFAULT_RESERVED_MEMORY 8192
-#  define DEFAULT_RESERVED_STACK 256
+#  define DEFAULT_RESERVED_STACK 64 /* KB */
 #  define DEFAULT_PROCESS_PRIORITY -18
 #else
 #  define DEFAULT_ACTIVATION 0
 #endif
 
+#define DEFAULT_USE_LINEAR_TARGET 1
 #define DEFAULT_STRIPE_FILLER "error"
 #define DEFAULT_MIRROR_REGION_SIZE 512	/* KB */
 #define DEFAULT_INTERVAL 15
@@ -129,13 +152,13 @@
 #define DEFAULT_REP_QUOTED 1
 #define DEFAULT_REP_SEPARATOR " "
 
-#define DEFAULT_LVS_COLS "lv_name,vg_name,lv_attr,lv_size,origin,snap_percent,move_pv,mirror_log,copy_percent,convert_lv"
+#define DEFAULT_LVS_COLS "lv_name,vg_name,lv_attr,lv_size,pool_lv,origin,data_percent,move_pv,mirror_log,copy_percent,convert_lv"
 #define DEFAULT_VGS_COLS "vg_name,pv_count,lv_count,snap_count,vg_attr,vg_size,vg_free"
 #define DEFAULT_PVS_COLS "pv_name,vg_name,pv_fmt,pv_attr,pv_size,pv_free"
 #define DEFAULT_SEGS_COLS "lv_name,vg_name,lv_attr,stripes,segtype,seg_size"
 #define DEFAULT_PVSEGS_COLS "pv_name,vg_name,pv_fmt,pv_attr,pv_size,pv_free,pvseg_start,pvseg_size"
 
-#define DEFAULT_LVS_COLS_VERB "lv_name,vg_name,seg_count,lv_attr,lv_size,lv_major,lv_minor,lv_kernel_major,lv_kernel_minor,origin,snap_percent,move_pv,copy_percent,mirror_log,convert_lv,lv_uuid"
+#define DEFAULT_LVS_COLS_VERB "lv_name,vg_name,seg_count,lv_attr,lv_size,lv_major,lv_minor,lv_kernel_major,lv_kernel_minor,pool_lv,origin,data_percent,metadata_percent,move_pv,copy_percent,mirror_log,convert_lv,lv_uuid"
 #define DEFAULT_VGS_COLS_VERB "vg_name,vg_attr,vg_extent_size,pv_count,lv_count,snap_count,vg_size,vg_free,vg_uuid"
 #define DEFAULT_PVS_COLS_VERB "pv_name,vg_name,pv_fmt,pv_attr,pv_size,pv_free,dev_size,pv_uuid"
 #define DEFAULT_SEGS_COLS_VERB "lv_name,vg_name,lv_attr,seg_start,seg_size,stripes,segtype,stripesize,chunksize"
@@ -151,5 +174,7 @@
 #define DEFAULT_MIRROR_LOG_FAULT_POLICY "allocate"
 #define DEFAULT_SNAPSHOT_AUTOEXTEND_THRESHOLD 100
 #define DEFAULT_SNAPSHOT_AUTOEXTEND_PERCENT 20
+#define DEFAULT_THIN_POOL_AUTOEXTEND_THRESHOLD 100
+#define DEFAULT_THIN_POOL_AUTOEXTEND_PERCENT 20
 
 #endif				/* _LVM_DEFAULTS_H */

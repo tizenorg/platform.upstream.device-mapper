@@ -1,9 +1,11 @@
 @top_srcdir@/daemons/clvmd/clvm.h
 @top_srcdir@/daemons/dmeventd/libdevmapper-event.h
+@top_srcdir@/daemons/lvmetad/lvmetad-client.h
 @top_srcdir@/liblvm/lvm2app.h
 @top_srcdir@/lib/activate/activate.h
 @top_srcdir@/lib/activate/targets.h
 @top_srcdir@/lib/cache/lvmcache.h
+@top_srcdir@/lib/cache/lvmetad.h
 @top_srcdir@/lib/commands/errors.h
 @top_srcdir@/lib/commands/toolcontext.h
 @top_srcdir@/lib/config/config.h
@@ -16,6 +18,7 @@
 @top_srcdir@/lib/display/display.h
 @top_srcdir@/lib/filters/filter-composite.h
 @top_srcdir@/lib/filters/filter-md.h
+@top_srcdir@/lib/filters/filter-mpath.h
 @top_srcdir@/lib/filters/filter-persistent.h
 @top_srcdir@/lib/filters/filter-regex.h
 @top_srcdir@/lib/filters/filter-sysfs.h
@@ -57,6 +60,9 @@
 @top_srcdir@/lib/report/properties.h
 @top_srcdir@/lib/report/report.h
 @top_srcdir@/lib/uuid/uuid.h
+@top_srcdir@/libdaemon/client/daemon-client.h
+@top_srcdir@/libdaemon/client/daemon-io.h
+@top_srcdir@/libdaemon/client/config-util.h
 @top_srcdir@/libdm/libdevmapper.h
 @top_srcdir@/libdm/misc/dm-ioctl.h
 @top_srcdir@/libdm/misc/dm-logging.h

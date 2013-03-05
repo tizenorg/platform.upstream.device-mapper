@@ -104,7 +104,7 @@ int lvrename(struct cmd_context *cmd, int argc, char **argv)
 	log_verbose("Checking for existing volume group \"%s\"", vg_name);
 	vg = vg_read_for_update(cmd, vg_name, NULL, 0);
 	if (vg_read_error(vg)) {
-		free_vg(vg);
+		release_vg(vg);
 		stack;
 		return ECMD_FAILED;
 	}
@@ -115,14 +115,29 @@ int lvrename(struct cmd_context *cmd, int argc, char **argv)
 		goto error;
 	}
 
+	if (lvl->lv->status & (RAID_IMAGE | RAID_META)) {
+		log_error("Cannot rename a RAID %s directly",
+			  (lvl->lv->status & RAID_IMAGE) ? "image" :
+			  "metadata area");
+		r = ECMD_FAILED;
+		goto error;
+	}
+
+	if (lv_is_raid_with_tracking(lvl->lv)) {
+		log_error("Cannot rename %s while it is tracking a split image",
+			  lvl->lv->name);
+		r = ECMD_FAILED;
+		goto error;
+	}
+
 	if (!lv_rename(cmd, lvl->lv, lv_name_new))
 		goto error;
 
-	log_print("Renamed \"%s\" to \"%s\" in volume group \"%s\"",
-		  lv_name_old, lv_name_new, vg_name);
+	log_print_unless_silent("Renamed \"%s\" to \"%s\" in volume group \"%s\"",
+				lv_name_old, lv_name_new, vg_name);
 
 	r = ECMD_PROCESSED;
 error:
-	unlock_and_free_vg(cmd, vg, vg_name);
+	unlock_and_release_vg(cmd, vg, vg_name);
 	return r;
 }

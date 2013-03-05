@@ -15,6 +15,9 @@
 /* Path to cmirrord pidfile. */
 #undef CMIRRORD_PIDFILE
 
+/* Define to 0 to exclude libSaCkpt. */
+#undef CMIRROR_HAS_CHECKPOINT
+
 /* Define to one of `_getb67', `GETB67', `getb67' for Cray-2 and Cray-YMP
    systems. This function is required for `alloca.c' support on those systems.
    */
@@ -35,10 +38,22 @@
 /* Default data alignment. */
 #undef DEFAULT_DATA_ALIGNMENT
 
+/* Define default node creation behavior with dmsetup create */
+#undef DEFAULT_DM_ADD_NODE
+
+/* Define default name mangling behaviour */
+#undef DEFAULT_DM_NAME_MANGLING
+
+/* Default DM run directory. */
+#undef DEFAULT_DM_RUN_DIR
+
 /* Name of default locking directory. */
 #undef DEFAULT_LOCK_DIR
 
-/* Name of default run directory. */
+/* Default directory to keep PID files in. */
+#undef DEFAULT_PID_DIR
+
+/* Default LVM run directory. */
 #undef DEFAULT_RUN_DIR
 
 /* Define to 0 to reinstate the pre-2.02.54 handling of unit suffixes. */
@@ -81,11 +96,11 @@
 /* Define to 1 if canonicalize_file_name is available. */
 #undef HAVE_CANONICALIZE_FILE_NAME
 
-/* Define to 1 if you have the <ccs.h> header file. */
-#undef HAVE_CCS_H
-
 /* Define to 1 if your system has a working `chown' function. */
 #undef HAVE_CHOWN
+
+/* Define to 1 if you have the <corosync/cmap.h> header file. */
+#undef HAVE_COROSYNC_CMAP_H
 
 /* Define to 1 if you have the <corosync/confdb.h> header file. */
 #undef HAVE_COROSYNC_CONFDB_H
@@ -155,9 +170,6 @@
 
 /* Define to 1 if you have the <libgen.h> header file. */
 #undef HAVE_LIBGEN_H
-
-/* Define to 1 if you have the <libgulm.h> header file. */
-#undef HAVE_LIBGULM_H
 
 /* Define to 1 if you have the <libintl.h> header file. */
 #undef HAVE_LIBINTL_H
@@ -334,7 +346,7 @@
 /* Define to 1 if you have the `strtoul' function. */
 #undef HAVE_STRTOUL
 
-/* Define to 1 if `st_rdev' is member of `struct stat'. */
+/* Define to 1 if `st_rdev' is a member of `struct stat'. */
 #undef HAVE_STRUCT_STAT_ST_RDEV
 
 /* Define to 1 if you have the <syslog.h> header file. */
@@ -420,9 +432,6 @@
 /* Define to 1 if you have the <utmpx.h> header file. */
 #undef HAVE_UTMPX_H
 
-/* Define to 1 if you have the <valgrind/memcheck.h> header file. */
-#undef HAVE_VALGRIND_MEMCHECK_H
-
 /* Define to 1 if you have the `vfork' function. */
 #undef HAVE_VFORK
 
@@ -448,6 +457,12 @@
 
 /* Define to 1 to include built-in support for LVM1 metadata. */
 #undef LVM1_INTERNAL
+
+/* Path to lvmetad pidfile. */
+#undef LVMETAD_PIDFILE
+
+/* Define to 1 to include code that uses lvmetad. */
+#undef LVMETAD_SUPPORT
 
 /* Path to lvm binary. */
 #undef LVM_PATH
@@ -481,11 +496,17 @@
 /* Define to the one symbol short name of this package. */
 #undef PACKAGE_TARNAME
 
+/* Define to the home page for this package. */
+#undef PACKAGE_URL
+
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
 /* Define to 1 to include built-in support for GFS pool metadata. */
 #undef POOL_INTERNAL
+
+/* Define to 1 to include built-in support for raid. */
+#undef RAID_INTERNAL
 
 /* Define to 1 to include the LVM readline shell. */
 #undef READLINE_SUPPORT
@@ -518,6 +539,12 @@
 
 /* Define to 1 if you have the ANSI C header files. */
 #undef STDC_HEADERS
+
+/* The path to 'thin_check', if available. */
+#undef THIN_CHECK_CMD
+
+/* Define to 1 to include built-in support for thin provisioning. */
+#undef THIN_INTERNAL
 
 /* Define to 1 if you can safely include both <sys/time.h> and <time.h>. */
 #undef TIME_WITH_SYS_TIME

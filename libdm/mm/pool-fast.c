@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2010 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2011 Red Hat, Inc. All rights reserved.
  *
  * This file is part of the device-mapper userspace tools.
  *
@@ -14,23 +14,27 @@
  */
 
 #ifdef VALGRIND_POOL
-#include "valgrind/memcheck.h"
+#include "memcheck.h"
 #endif
 
 #include "dmlib.h"
+#include <malloc.h>
 
 struct chunk {
 	char *begin, *end;
 	struct chunk *prev;
-};
+} __attribute__((aligned(8)));
 
 struct dm_pool {
 	struct dm_list list;
 	struct chunk *chunk, *spare_chunk;	/* spare_chunk is a one entry free
 						   list to stop 'bobbling' */
+	const char *name;
 	size_t chunk_size;
 	size_t object_len;
 	unsigned object_alignment;
+	int locked;
+	long crc;
 };
 
 static void _align_chunk(struct chunk *c, unsigned alignment);
@@ -51,6 +55,7 @@ struct dm_pool *dm_pool_create(const char *name, size_t chunk_hint)
 		return 0;
 	}
 
+	p->name = name;
 	/* round chunk_hint up to the next power of 2 */
 	p->chunk_size = chunk_hint + sizeof(struct chunk);
 	while (new_size < p->chunk_size)
@@ -236,6 +241,9 @@ void *dm_pool_end_object(struct dm_pool *p)
 
 void dm_pool_abandon_object(struct dm_pool *p)
 {
+#ifdef VALGRIND_POOL
+	VALGRIND_MAKE_MEM_NOACCESS(p->chunk, p->object_len);
+#endif
 	p->object_len = 0;
 	p->object_alignment = DEFAULT_ALIGNMENT;
 }
@@ -250,12 +258,28 @@ static struct chunk *_new_chunk(struct dm_pool *p, size_t s)
 	struct chunk *c;
 
 	if (p->spare_chunk &&
-	    ((p->spare_chunk->end - p->spare_chunk->begin) >= s)) {
+	    ((p->spare_chunk->end - p->spare_chunk->begin) >= (ptrdiff_t)s)) {
 		/* reuse old chunk */
 		c = p->spare_chunk;
 		p->spare_chunk = 0;
 	} else {
-		if (!(c = dm_malloc(s))) {
+#ifdef DEBUG_ENFORCE_POOL_LOCKING
+		if (!pagesize) {
+			pagesize = getpagesize(); /* lvm_pagesize(); */
+			pagesize_mask = pagesize - 1;
+		}
+		/*
+		 * Allocate page aligned size so malloc could work.
+		 * Otherwise page fault would happen from pool unrelated
+		 * memory writes of internal malloc pointers.
+		 */
+#  define aligned_malloc(s)	(posix_memalign((void**)&c, pagesize, \
+						ALIGN_ON_PAGE(s)) == 0)
+#else
+#  define aligned_malloc(s)	(c = dm_malloc(s))
+#endif /* DEBUG_ENFORCE_POOL_LOCKING */
+		if (!aligned_malloc(s)) {
+#undef aligned_malloc
 			log_error("Out of memory.  Requested %" PRIsize_t
 				  " bytes.", s);
 			return NULL;
@@ -276,11 +300,59 @@ static struct chunk *_new_chunk(struct dm_pool *p, size_t s)
 
 static void _free_chunk(struct chunk *c)
 {
-	if (c) {
 #ifdef VALGRIND_POOL
-		VALGRIND_MAKE_MEM_UNDEFINED(c, c->end - (char *) c);
+#  ifdef DEBUG_MEM
+	if (c)
+		VALGRIND_MAKE_MEM_UNDEFINED(c + 1, c->end - (char *) (c + 1));
+#  endif
 #endif
+#ifdef DEBUG_ENFORCE_POOL_LOCKING
+	/* since DEBUG_MEM is using own memory list */
+	free(c); /* for posix_memalign() */
+#else
+	dm_free(c);
+#endif
+}
 
-		dm_free(c);
+
+/**
+ * Calc crc/hash from pool's memory chunks with internal pointers
+ */
+static long _pool_crc(const struct dm_pool *p)
+{
+	long crc_hash = 0;
+#ifndef DEBUG_ENFORCE_POOL_LOCKING
+	const struct chunk *c;
+	const long *ptr, *end;
+
+	for (c = p->chunk; c; c = c->prev) {
+		end = (const long *) (c->begin < c->end ? (long) c->begin & ~7: (long) c->end);
+		ptr = (const long *) c;
+#ifdef VALGRIND_POOL
+		VALGRIND_MAKE_MEM_DEFINED(ptr, (end - ptr) * sizeof(*end));
+#endif
+		while (ptr < end) {
+			crc_hash += *ptr++;
+			crc_hash += (crc_hash << 10);
+			crc_hash ^= (crc_hash >> 6);
+		}
 	}
+#endif /* DEBUG_ENFORCE_POOL_LOCKING */
+
+	return crc_hash;
+}
+
+static int _pool_protect(struct dm_pool *p, int prot)
+{
+#ifdef DEBUG_ENFORCE_POOL_LOCKING
+	struct chunk *c;
+
+	for (c = p->chunk; c; c = c->prev) {
+		if (mprotect(c, (size_t) ((c->end - (char *) c) - 1), prot) != 0) {
+			log_sys_error("mprotect", "");
+			return 0;
+		}
+	}
+#endif
+	return 1;
 }

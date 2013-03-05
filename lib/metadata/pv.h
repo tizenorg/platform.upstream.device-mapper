@@ -22,8 +22,10 @@ struct volume_group;
 
 struct physical_volume {
 	struct id id;
+	struct id old_id;		/* Set during pvchange -u. */
 	struct device *dev;
 	const struct format_type *fmt;
+	struct format_instance *fid;
 
 	/*
 	 * vg_name and vgid are used before the parent VG struct exists.
@@ -48,6 +50,12 @@ struct physical_volume {
 	uint32_t pe_alloc_count;
 	unsigned long pe_align;
 	unsigned long pe_align_offset;
+
+        /* This is true whenever the represented PV has a label associated. */
+        uint64_t is_labelled:1;
+
+        /* NB. label_sector is valid whenever is_labelled is true */
+	uint64_t label_sector;
 
 	struct dm_list segments;	/* Ordered pv_segments covering complete PV */
 	struct dm_list tags;

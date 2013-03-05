@@ -12,9 +12,10 @@
  * Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#include "lvm2app.h"
+#undef NDEBUG
 
-#define assert(x) do { if (!(x)) goto bad; } while (0)
+#include "lvm2app.h"
+#include "assert.h"
 
 int main(int argc, char *argv[])
 {
@@ -22,6 +23,7 @@ int main(int argc, char *argv[])
 	vg_t vg = NULL;
 	lv_t lv;
 	struct lvm_property_value v;
+	struct lvm_property_value d;
 
 	handle = lvm_init(NULL);
         assert(handle);
@@ -36,7 +38,7 @@ int main(int argc, char *argv[])
         assert(v.is_valid);
         assert(v.value.integer == PERCENT_0);
 
-        lv = lvm_lv_from_name(vg, "mirr");
+	lv = lvm_lv_from_name(vg, "mirr");
         assert(lv);
 
         v = lvm_lv_get_property(lv, "copy_percent");
@@ -50,15 +52,12 @@ int main(int argc, char *argv[])
         assert(v.is_valid);
         assert(v.value.integer == 50 * PERCENT_1);
 
-        lvm_vg_close(vg);
-        return 0;
+	d = lvm_lv_get_property(lv, "data_percent");
+	assert(d.is_valid);
+	assert(d.value.integer == v.value.integer);
 
-bad:
-	if (handle && lvm_errno(handle))
-		fprintf(stderr, "LVM Error: %s\n", lvm_errmsg(handle));
-	if (vg)
-		lvm_vg_close(vg);
-	if (handle)
-		lvm_quit(handle);
-	return 1;
+        lvm_vg_close(vg);
+
+	lvm_quit(handle);
+        return 0;
 }

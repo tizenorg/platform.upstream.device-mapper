@@ -16,14 +16,9 @@
 #include "toolcontext.h"
 #include "segtype.h"
 #include "display.h"
-#include "text_export.h"
-#include "text_import.h"
 #include "config.h"
 #include "str_list.h"
-#include "targets.h"
-#include "lvm-string.h"
 #include "activate.h"
-#include "metadata.h"
 
 static const char *_zero_name(const struct lv_segment *seg)
 {
@@ -44,6 +39,7 @@ static int _zero_add_target_line(struct dev_manager *dm __attribute__((unused)),
 				 struct cmd_context *cmd __attribute__((unused)),
 				 void **target_state __attribute__((unused)),
 				 struct lv_segment *seg __attribute__((unused)),
+				 const struct lv_activate_opts *laopts __attribute__((unused)),
 				 struct dm_tree_node *node,uint64_t len,
 				 uint32_t *pvmove_mirror_count __attribute__((unused)))
 {
@@ -96,7 +92,7 @@ static struct segtype_handler _zero_ops = {
 
 struct segment_type *init_zero_segtype(struct cmd_context *cmd)
 {
-	struct segment_type *segtype = dm_malloc(sizeof(*segtype));
+	struct segment_type *segtype = dm_zalloc(sizeof(*segtype));
 
 	if (!segtype)
 		return_NULL;

@@ -14,8 +14,6 @@
 
 #include "lib.h"
 #include "metadata.h"
-#include "xlate.h"
-#include "filter.h"
 
 #ifdef linux
 
@@ -42,14 +40,15 @@ int dev_is_swap(struct device *dev, uint64_t *signature)
 {
 	char buf[10];
 	uint64_t size;
-	int page, ret = 0;
+	unsigned page;
+	int ret = 0;
 
 	if (!dev_get_size(dev, &size)) {
 		stack;
 		return -1;
 	}
 
-	if (!dev_open(dev)) {
+	if (!dev_open_readonly(dev)) {
 		stack;
 		return -1;
 	}

@@ -39,13 +39,27 @@
 #include <arpa/inet.h>		/* for htonl, ntohl */
 
 #ifdef linux
-#  include <malloc.h>
-
-#  define OOM_ADJ_FILE "/proc/self/oom_adj"
+/*
+ * Kernel version 2.6.36 and higher has
+ * new OOM killer adjustment interface.
+ */
+#  define OOM_ADJ_FILE_OLD "/proc/self/oom_adj"
+#  define OOM_ADJ_FILE "/proc/self/oom_score_adj"
 
 /* From linux/oom.h */
+/* Old interface */
 #  define OOM_DISABLE (-17)
 #  define OOM_ADJUST_MIN (-16)
+/* New interface */
+#  define OOM_SCORE_ADJ_MIN (-1000)
+
+/* Systemd on-demand activation support */
+#  define SD_ACTIVATION_ENV_VAR_NAME "SD_ACTIVATION"
+#  define SD_LISTEN_PID_ENV_VAR_NAME "LISTEN_PID"
+#  define SD_LISTEN_FDS_ENV_VAR_NAME "LISTEN_FDS"
+#  define SD_LISTEN_FDS_START 3
+#  define SD_FD_FIFO_SERVER SD_LISTEN_FDS_START
+#  define SD_FD_FIFO_CLIENT (SD_LISTEN_FDS_START + 1)
 
 #endif
 
@@ -95,9 +109,8 @@ static pthread_mutex_t _global_mutex;
 
 #define THREAD_STACK_SIZE (300*1024)
 
-#define DEBUGLOG(fmt, args...) _debuglog(fmt, ## args)
-
 int dmeventd_debug = 0;
+static int _systemd_activation = 0;
 static int _foreground = 0;
 static int _restart = 0;
 static char **_initial_registrations = 0;
@@ -202,24 +215,6 @@ static int _timeout_running;
 static DM_LIST_INIT(_timeout_registry);
 static pthread_mutex_t _timeout_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t _timeout_cond = PTHREAD_COND_INITIALIZER;
-
-static void _debuglog(const char *fmt, ...)
-{
-        time_t P;
-        va_list ap;
- 
-        if (!_foreground)
-                return;
- 
-        va_start(ap,fmt);
-
-        time(&P);
-        fprintf(stderr, "dmeventd[%p]: %.15s ", (void *) pthread_self(), ctime(&P)+4 );
-        vfprintf(stderr, fmt, ap);
-	fprintf(stderr, "\n");
-
-        va_end(ap);
-}
 
 /* Allocate/free the status structure for a monitoring thread. */
 static struct thread_status *_alloc_thread_status(struct message_data *data,
@@ -407,7 +402,9 @@ static int _fill_device_data(struct thread_status *ts)
 	if (!dmt)
 		return 0;
 
-	dm_task_set_uuid(dmt, ts->device.uuid);
+	if (!dm_task_set_uuid(dmt, ts->device.uuid))
+		goto fail;
+
 	if (!dm_task_run(dmt))
 		goto fail;
 
@@ -450,7 +447,7 @@ static int _get_status(struct message_data *message_data)
 {
 	struct dm_event_daemon_message *msg = message_data->msg;
 	struct thread_status *thread;
-	int i = 0, j = 0;
+	int i, j;
 	int ret = -1;
 	int count = dm_list_size(&_thread_registry);
 	int size = 0, current = 0;
@@ -585,6 +582,7 @@ static void _unregister_for_timeout(struct thread_status *thread)
 	pthread_mutex_unlock(&_timeout_mutex);
 }
 
+__attribute__((format(printf, 4, 5)))
 static void _no_intr_log(int level, const char *file, int line,
 			const char *f, ...)
 {
@@ -740,8 +738,10 @@ static void _monitor_unregister(void *arg)
 			return;
 		}
 	thread->status = DM_THREAD_DONE;
+	pthread_mutex_lock(&_timeout_mutex);
 	UNLINK_THREAD(thread);
 	LINK(thread, &_thread_registry_unused);
+	pthread_mutex_unlock(&_timeout_mutex);
 	_unlock_mutex();
 }
 
@@ -752,7 +752,10 @@ static struct dm_task *_get_device_status(struct thread_status *ts)
 	if (!dmt)
 		return NULL;
 
-	dm_task_set_uuid(dmt, ts->device.uuid);
+	if (!dm_task_set_uuid(dmt, ts->device.uuid)) {
+		dm_task_destroy(dmt);
+		return NULL;
+	}
 
 	if (!dm_task_run(dmt)) {
 		dm_task_destroy(dmt);
@@ -996,10 +999,8 @@ static int _register_for_event(struct message_data *message_data)
 	   almost as good as dead already... */
 	if (thread_new->events & DM_EVENT_TIMEOUT) {
 		ret = -_register_for_timeout(thread_new);
-		if (ret) {
-		    _unlock_mutex();
-		    goto out;
-		}
+		if (ret)
+			goto outth;
 	}
 
 	if (!(thread = _lookup_thread_status(message_data))) {
@@ -1025,6 +1026,7 @@ static int _register_for_event(struct message_data *message_data)
 	/* Or event # into events bitfield. */
 	thread->events |= message_data->events.field;
 
+    outth:
 	_unlock_mutex();
 
       out:
@@ -1076,8 +1078,10 @@ static int _unregister_for_event(struct message_data *message_data)
 	 * unlink and terminate its monitoring thread.
 	 */
 	if (!thread->events) {
+		pthread_mutex_lock(&_timeout_mutex);
 		UNLINK_THREAD(thread);
 		LINK(thread, &_thread_registry_unused);
+		pthread_mutex_unlock(&_timeout_mutex);
 	}
 	_unlock_mutex();
 
@@ -1099,15 +1103,19 @@ static int _registered_device(struct message_data *message_data,
 	const char *id = message_data->id;
 	const char *dso = thread->dso_data->dso_name;
 	const char *dev = thread->device.uuid;
+	int r;
 	unsigned events = ((thread->status == DM_THREAD_RUNNING)
 			   && (thread->events)) ? thread->events : thread->
 	    events | DM_EVENT_REGISTRATION_PENDING;
 
 	dm_free(msg->data);
 
-	msg->size = dm_asprintf(&(msg->data), fmt, id, dso, dev, events);
+	if ((r = dm_asprintf(&(msg->data), fmt, id, dso, dev, events)) < 0) {
+		msg->size = 0;
+		return -ENOMEM;
+	}
 
-	_unlock_mutex();
+	msg->size = (uint32_t) r;
 
 	return 0;
 }
@@ -1140,6 +1148,7 @@ static int _want_registered_device(char *dso_name, char *device_uuid,
 static int _get_registered_dev(struct message_data *message_data, int next)
 {
 	struct thread_status *thread, *hit = NULL;
+	int ret = -ENOENT;
 
 	_lock_mutex();
 
@@ -1156,15 +1165,11 @@ static int _get_registered_dev(struct message_data *message_data, int next)
 	 * If we got a registered device and want the next one ->
 	 * fetch next conforming element off the list.
 	 */
-	if (hit && !next) {
-		_unlock_mutex();
-		return _registered_device(message_data, hit);
-	}
+	if (hit && !next)
+		goto reg;
 
 	if (!hit)
 		goto out;
-
-	thread = hit;
 
 	while (1) {
 		if (dm_list_end(&_thread_registry, &thread->list))
@@ -1177,13 +1182,13 @@ static int _get_registered_dev(struct message_data *message_data, int next)
 		}
 	}
 
-	_unlock_mutex();
-	return _registered_device(message_data, hit);
+      reg:
+	ret = _registered_device(message_data, hit);
 
       out:
 	_unlock_mutex();
-	
-	return -ENOENT;
+
+	return ret;
 }
 
 static int _get_registered_device(struct message_data *message_data)
@@ -1241,68 +1246,66 @@ static void _init_fifos(struct dm_event_fifos *fifos)
 /* Open fifos used for client communication. */
 static int _open_fifos(struct dm_event_fifos *fifos)
 {
-	int orig_errno;
+	struct stat st;
 
 	/* Create client fifo. */
 	(void) dm_prepare_selinux_context(fifos->client_path, S_IFIFO);
 	if ((mkfifo(fifos->client_path, 0600) == -1) && errno != EEXIST) {
-		syslog(LOG_ERR, "%s: Failed to create client fifo.\n", __func__);
-		orig_errno = errno;
+		syslog(LOG_ERR, "%s: Failed to create client fifo %s: %m.\n",
+		       __func__, fifos->client_path);
 		(void) dm_prepare_selinux_context(NULL, 0);
-		stack;
-		return -orig_errno;
+		return 0;
 	}
 
 	/* Create server fifo. */
 	(void) dm_prepare_selinux_context(fifos->server_path, S_IFIFO);
 	if ((mkfifo(fifos->server_path, 0600) == -1) && errno != EEXIST) {
-		syslog(LOG_ERR, "%s: Failed to create server fifo.\n", __func__);
-		orig_errno = errno;
+		syslog(LOG_ERR, "%s: Failed to create server fifo %s: %m.\n",
+		       __func__, fifos->server_path);
 		(void) dm_prepare_selinux_context(NULL, 0);
-		stack;
-		return -orig_errno;
+		return 0;
 	}
 
 	(void) dm_prepare_selinux_context(NULL, 0);
 
-	struct stat st;
-
 	/* Warn about wrong permissions if applicable */
 	if ((!stat(fifos->client_path, &st)) && (st.st_mode & 0777) != 0600)
-		syslog(LOG_WARNING, "Fixing wrong permissions on %s",
+		syslog(LOG_WARNING, "Fixing wrong permissions on %s: %m.\n",
 		       fifos->client_path);
 
 	if ((!stat(fifos->server_path, &st)) && (st.st_mode & 0777) != 0600)
-		syslog(LOG_WARNING, "Fixing wrong permissions on %s",
+		syslog(LOG_WARNING, "Fixing wrong permissions on %s: %m.\n",
 		       fifos->server_path);
 
 	/* If they were already there, make sure permissions are ok. */
 	if (chmod(fifos->client_path, 0600)) {
-		syslog(LOG_ERR, "Unable to set correct file permissions on %s",
+		syslog(LOG_ERR, "Unable to set correct file permissions on %s: %m.\n",
 		       fifos->client_path);
-		return -errno;
+		return 0;
 	}
 
 	if (chmod(fifos->server_path, 0600)) {
-		syslog(LOG_ERR, "Unable to set correct file permissions on %s",
+		syslog(LOG_ERR, "Unable to set correct file permissions on %s: %m.\n",
 		       fifos->server_path);
-		return -errno;
+		return 0;
 	}
 
 	/* Need to open read+write or we will block or fail */
 	if ((fifos->server = open(fifos->server_path, O_RDWR)) < 0) {
-		stack;
-		return -errno;
+		syslog(LOG_ERR, "Failed to open fifo server %s: %m.\n",
+		       fifos->server_path);
+		return 0;
 	}
 
 	/* Need to open read+write for select() to work. */
 	if ((fifos->client = open(fifos->client_path, O_RDWR)) < 0) {
-		stack;
-		close(fifos->server);
-		return -errno;
+		syslog(LOG_ERR, "Failed to open fifo client %s: %m", fifos->client_path);
+		if (close(fifos->server))
+			syslog(LOG_ERR, "Failed to close fifo server %s: %m", fifos->server_path);
+		return 0;
 	}
 
-	return 0;
+	return 1;
 }
 
 /*
@@ -1405,7 +1408,7 @@ static int _client_write(struct dm_event_fifos *fifos,
 static int _handle_request(struct dm_event_daemon_message *msg,
 			  struct message_data *message_data)
 {
-	static struct {
+	static struct request {
 		unsigned int cmd;
 		int (*f)(struct message_data *);
 	} requests[] = {
@@ -1420,7 +1423,7 @@ static int _handle_request(struct dm_event_daemon_message *msg,
 		{ DM_EVENT_CMD_GET_STATUS, _get_status},
 	}, *req;
 
-	for (req = requests; req < requests + sizeof(requests); req++)
+	for (req = requests; req < requests + sizeof(requests) / sizeof(struct request); req++)
 		if (req->cmd == msg->cmd)
 			return req->f(message_data);
 
@@ -1432,17 +1435,16 @@ static int _do_process_request(struct dm_event_daemon_message *msg)
 {
 	int ret;
 	char *answer;
-	static struct message_data message_data;
+	struct message_data message_data = { .msg =  msg };
 
 	/* Parse the message. */
-	memset(&message_data, 0, sizeof(message_data));
-	message_data.msg = msg;
 	if (msg->cmd == DM_EVENT_CMD_HELLO || msg->cmd == DM_EVENT_CMD_DIE)  {
 		ret = 0;
 		answer = msg->data;
 		if (answer) {
-			msg->size = dm_asprintf(&(msg->data), "%s %s", answer,
-						msg->cmd == DM_EVENT_CMD_DIE ? "DYING" : "HELLO");
+			msg->size = dm_asprintf(&(msg->data), "%s %s %d", answer,
+						msg->cmd == DM_EVENT_CMD_DIE ? "DYING" : "HELLO",
+                                                DM_EVENT_PROTOCOL_VERSION);
 			dm_free(answer);
 		} else {
 			msg->size = 0;
@@ -1467,9 +1469,7 @@ static int _do_process_request(struct dm_event_daemon_message *msg)
 static void _process_request(struct dm_event_fifos *fifos)
 {
 	int die = 0;
-	struct dm_event_daemon_message msg;
-
-	memset(&msg, 0, sizeof(msg));
+	struct dm_event_daemon_message msg = { 0 };
 
 	/*
 	 * Read the request from the client (client_read, client_write
@@ -1488,9 +1488,9 @@ static void _process_request(struct dm_event_fifos *fifos)
 	if (!_client_write(fifos, &msg))
 		stack;
 
-	if (die) raise(9);
-
 	dm_free(msg.data);
+
+	if (die) raise(9);
 }
 
 static void _process_initial_registrations(void)
@@ -1501,9 +1501,10 @@ static void _process_initial_registrations(void)
 
 	while ((reg = _initial_registrations[i])) {
 		msg.cmd = DM_EVENT_CMD_REGISTER_FOR_EVENT;
-		msg.size = strlen(reg);
-		msg.data = reg;
-		_do_process_request(&msg);
+		if ((msg.size = strlen(reg))) {
+			msg.data = reg;
+			_do_process_request(&msg);
+		}
 		++ i;
 	}
 }
@@ -1513,6 +1514,7 @@ static void _cleanup_unused_threads(void)
 	int ret;
 	struct dm_list *l;
 	struct thread_status *thread;
+	int join_ret = 0;
 
 	_lock_mutex();
 	while ((l = dm_list_first(&_thread_registry_unused))) {
@@ -1552,12 +1554,15 @@ static void _cleanup_unused_threads(void)
 
 		if (thread->status == DM_THREAD_DONE) {
 			dm_list_del(l);
-			pthread_join(thread->thread, NULL);
+			join_ret = pthread_join(thread->thread, NULL);
 			_free_thread_status(thread);
 		}
 	}
 
 	_unlock_mutex();
+
+	if (join_ret)
+		syslog(LOG_ERR, "Failed pthread_join: %s\n", strerror(join_ret));
 }
 
 static void _sig_alarm(int signum __attribute__((unused)))
@@ -1569,10 +1574,8 @@ static void _sig_alarm(int signum __attribute__((unused)))
 static void _init_thread_signals(void)
 {
 	sigset_t my_sigset;
-	struct sigaction act;
+	struct sigaction act = { .sa_handler = _sig_alarm };
 
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = _sig_alarm;
 	sigaction(SIGALRM, &act, NULL);
 	sigfillset(&my_sigset);
 
@@ -1610,40 +1613,138 @@ static void _exit_handler(int sig __attribute__((unused)))
 }
 
 #ifdef linux
-/*
- * Protection against OOM killer if kernel supports it
- */
-static int _set_oom_adj(int val)
+static int _set_oom_adj(const char *oom_adj_path, int val)
 {
 	FILE *fp;
 
-	struct stat st;
-
-	if (stat(OOM_ADJ_FILE, &st) == -1) {
-		if (errno == ENOENT)
-			DEBUGLOG(OOM_ADJ_FILE " not found");
-		else
-			perror(OOM_ADJ_FILE ": stat failed");
-		return 1;
-	}
-
-	if (!(fp = fopen(OOM_ADJ_FILE, "w"))) {
-		perror(OOM_ADJ_FILE ": fopen failed");
+	if (!(fp = fopen(oom_adj_path, "w"))) {
+		perror("oom_adj: fopen failed");
 		return 0;
 	}
 
 	fprintf(fp, "%i", val);
+
 	if (dm_fclose(fp))
-		perror(OOM_ADJ_FILE ": fclose failed");
+		perror("oom_adj: fclose failed");
 
 	return 1;
 }
+
+/*
+ * Protection against OOM killer if kernel supports it
+ */
+static int _protect_against_oom_killer(void)
+{
+	struct stat st;
+
+	if (stat(OOM_ADJ_FILE, &st) == -1) {
+		if (errno != ENOENT)
+			perror(OOM_ADJ_FILE ": stat failed");
+
+		/* Try old oom_adj interface as a fallback */
+		if (stat(OOM_ADJ_FILE_OLD, &st) == -1) {
+			if (errno == ENOENT)
+				perror(OOM_ADJ_FILE_OLD " not found");
+			else
+				perror(OOM_ADJ_FILE_OLD ": stat failed");
+			return 1;
+		}
+
+		return _set_oom_adj(OOM_ADJ_FILE_OLD, OOM_DISABLE) ||
+		       _set_oom_adj(OOM_ADJ_FILE_OLD, OOM_ADJUST_MIN);
+	}
+
+	return _set_oom_adj(OOM_ADJ_FILE, OOM_SCORE_ADJ_MIN);
+}
+
+static int _handle_preloaded_fifo(int fd, const char *path)
+{
+	struct stat st_fd, st_path;
+	int flags;
+
+	if ((flags = fcntl(fd, F_GETFD)) < 0)
+		return 0;
+
+	if (flags & FD_CLOEXEC)
+		return 0;
+
+	if (fstat(fd, &st_fd) < 0 || !S_ISFIFO(st_fd.st_mode))
+		return 0;
+
+	if (stat(path, &st_path) < 0 ||
+	    st_path.st_dev != st_fd.st_dev ||
+	    st_path.st_ino != st_fd.st_ino)
+		return 0;
+
+	if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+		return 0;
+
+	return 1;
+}
+
+static int _systemd_handover(struct dm_event_fifos *fifos)
+{
+	const char *e;
+	char *p;
+	unsigned long env_pid, env_listen_fds;
+	int r = 0;
+
+	memset(fifos, 0, sizeof(*fifos));
+
+	/* SD_ACTIVATION must be set! */
+	if (!(e = getenv(SD_ACTIVATION_ENV_VAR_NAME)) || strcmp(e, "1"))
+		goto out;
+
+	/* LISTEN_PID must be equal to our PID! */
+	if (!(e = getenv(SD_LISTEN_PID_ENV_VAR_NAME)))
+		goto out;
+
+	errno = 0;
+	env_pid = strtoul(e, &p, 10);
+	if (errno || !p || *p || env_pid <= 0 ||
+	    getpid() != (pid_t) env_pid)
+		goto out;
+
+	/* LISTEN_FDS must be 2 and the fds must be FIFOSs! */
+	if (!(e = getenv(SD_LISTEN_FDS_ENV_VAR_NAME)))
+		goto out;
+
+	errno = 0;
+	env_listen_fds = strtoul(e, &p, 10);
+	if (errno || !p || *p || env_listen_fds != 2)
+		goto out;
+
+	/* Check and handle the FIFOs passed in */
+	r = (_handle_preloaded_fifo(SD_FD_FIFO_SERVER, DM_EVENT_FIFO_SERVER) &&
+	     _handle_preloaded_fifo(SD_FD_FIFO_CLIENT, DM_EVENT_FIFO_CLIENT));
+
+	if (r) {
+		fifos->server = SD_FD_FIFO_SERVER;
+		fifos->server_path = DM_EVENT_FIFO_SERVER;
+		fifos->client = SD_FD_FIFO_CLIENT;
+		fifos->client_path = DM_EVENT_FIFO_CLIENT;
+	}
+
+out:
+	unsetenv(SD_ACTIVATION_ENV_VAR_NAME);
+	unsetenv(SD_LISTEN_PID_ENV_VAR_NAME);
+	unsetenv(SD_LISTEN_FDS_ENV_VAR_NAME);
+	return r;
+}
 #endif
 
-static void remove_lockfile(void)
+static void _remove_files_on_exit(void)
 {
 	if (unlink(DMEVENTD_PIDFILE))
 		perror(DMEVENTD_PIDFILE ": unlink failed");
+
+	if (!_systemd_activation) {
+		if (unlink(DM_EVENT_FIFO_CLIENT))
+			perror(DM_EVENT_FIFO_CLIENT " : unlink failed");
+
+		if (unlink(DM_EVENT_FIFO_SERVER))
+			perror(DM_EVENT_FIFO_SERVER " : unlink failed");
+	}
 }
 
 static void _daemonize(void)
@@ -1703,8 +1804,15 @@ static void _daemonize(void)
 	else
 		fd = rlim.rlim_cur;
 
-	for (--fd; fd >= 0; fd--)
-		close(fd);
+	for (--fd; fd >= 0; fd--) {
+#ifdef linux
+		/* Do not close fds preloaded by systemd! */
+		if (_systemd_activation &&
+		    (fd == SD_FD_FIFO_SERVER || fd == SD_FD_FIFO_CLIENT))
+			continue;
+#endif
+		(void) close(fd);
+	}
 
 	if ((open("/dev/null", O_RDONLY) < 0) ||
 	    (open("/dev/null", O_WRONLY) < 0) ||
@@ -1721,16 +1829,25 @@ static void restart(void)
 	int i, count = 0;
 	char *message;
 	int length;
+	int version;
 
 	/* Get the list of registrations from the running daemon. */
 
 	if (!init_fifos(&fifos)) {
-		fprintf(stderr, "Could not initiate communication with existing dmeventd.\n");
+		fprintf(stderr, "WARNING: Could not initiate communication with existing dmeventd.\n");
 		exit(EXIT_FAILURE);
 	}
 
-	if (daemon_talk(&fifos, &msg, DM_EVENT_CMD_HELLO, NULL, NULL, 0, 0)) {
-		fprintf(stderr, "Could not communicate with existing dmeventd.\n");
+	if (!dm_event_get_version(&fifos, &version)) {
+		fprintf(stderr, "WARNING: Could not communicate with existing dmeventd.\n");
+		fini_fifos(&fifos);
+		exit(EXIT_FAILURE);
+	}
+
+	if (version < 1) {
+		fprintf(stderr, "WARNING: The running dmeventd instance is too old.\n"
+			        "Protocol version %d (required: 1). Action cancelled.\n",
+			        version);
 		exit(EXIT_FAILURE);
 	}
 
@@ -1749,9 +1866,16 @@ static void restart(void)
 		}
 	}
 
-	_initial_registrations = dm_malloc(sizeof(char*) * (count + 1));
+	if (!(_initial_registrations = dm_malloc(sizeof(char*) * (count + 1)))) {
+		fprintf(stderr, "Memory allocation registration failed.\n");
+		exit(EXIT_FAILURE);
+	}
+
 	for (i = 0; i < count; ++i) {
-		_initial_registrations[i] = dm_strdup(message);
+		if (!(_initial_registrations[i] = dm_strdup(message))) {
+			fprintf(stderr, "Memory allocation for message failed.\n");
+			exit(EXIT_FAILURE);
+		}
 		message += strlen(message) + 1;
 	}
 	_initial_registrations[count] = 0;
@@ -1761,17 +1885,28 @@ static void restart(void)
 		exit(EXIT_FAILURE);
 	}
 
+	/*
+	 * Wait for daemon to die, detected by sending further DIE messages
+	 * until one fails.
+	 */
+	for (i = 0; i < 10; ++i) {
+		if (daemon_talk(&fifos, &msg, DM_EVENT_CMD_DIE, "-", "-", 0, 0))
+			break; /* yep, it's dead probably */
+		usleep(10);
+	}
+
 	fini_fifos(&fifos);
 }
 
 static void usage(char *prog, FILE *file)
 {
 	fprintf(file, "Usage:\n"
-		"%s [-V] [-h] [-d] [-d] [-d] [-f]\n\n"
-		"   -V       Show version of dmeventd\n"
-		"   -h       Show this help information\n"
+		"%s [-d [-d [-d]]] [-f] [-h] [-R] [-V] [-?]\n\n"
 		"   -d       Log debug messages to syslog (-d, -dd, -ddd)\n"
-		"   -f       Don't fork, run in the foreground\n\n", prog);
+		"   -f       Don't fork, run in the foreground\n"
+		"   -h -?    Show this help information\n"
+		"   -R       Restart dmeventd\n"
+		"   -V       Show version of dmeventd\n\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -1803,7 +1938,6 @@ int main(int argc, char *argv[])
 		case 'V':
 			printf("dmeventd version: %s\n", DM_LIB_VERSION);
 			exit(1);
-			break;
 		}
 	}
 
@@ -1818,6 +1952,10 @@ int main(int argc, char *argv[])
 	if (_restart)
 		restart();
 
+#ifdef linux
+	_systemd_activation = _systemd_handover(&fifos);
+#endif
+
 	if (!_foreground)
 		_daemonize();
 
@@ -1827,17 +1965,19 @@ int main(int argc, char *argv[])
 	if (dm_create_lockfile(DMEVENTD_PIDFILE) == 0)
 		exit(EXIT_FAILURE);
 
-	atexit(remove_lockfile);
+	atexit(_remove_files_on_exit);
 	(void) dm_prepare_selinux_context(NULL, 0);
 
 	/* Set the rest of the signals to cause '_exit_now' to be set */
+	signal(SIGTERM, &_exit_handler);
 	signal(SIGINT, &_exit_handler);
 	signal(SIGHUP, &_exit_handler);
 	signal(SIGQUIT, &_exit_handler);
 
 #ifdef linux
-	if (!_set_oom_adj(OOM_DISABLE) && !_set_oom_adj(OOM_ADJUST_MIN))
-		syslog(LOG_ERR, "Failed to set oom_adj to protect against OOM killer");
+	/* Systemd has adjusted oom killer for us already */
+	if (!_systemd_activation && !_protect_against_oom_killer())
+		syslog(LOG_ERR, "Failed to protect against OOM killer");
 #endif
 
 	_init_thread_signals();
@@ -1847,11 +1987,12 @@ int main(int argc, char *argv[])
 	//multilog_init_verbose(std_syslog, _LOG_DEBUG);
 	//multilog_async(1);
 
-	_init_fifos(&fifos);
+	if (!_systemd_activation)
+		_init_fifos(&fifos);
 
 	pthread_mutex_init(&_global_mutex, NULL);
 
-	if (_open_fifos(&fifos))
+	if (!_systemd_activation && !_open_fifos(&fifos))
 		exit(EXIT_FIFO_FAILURE);
 
 	/* Signal parent, letting them know we are ready to go. */
@@ -1865,11 +2006,13 @@ int main(int argc, char *argv[])
 	while (!_exit_now) {
 		_process_request(&fifos);
 		_cleanup_unused_threads();
+		_lock_mutex();
 		if (!dm_list_empty(&_thread_registry)
 		    || !dm_list_empty(&_thread_registry_unused))
 			_thread_registries_empty = 0;
 		else
 			_thread_registries_empty = 1;
+		_unlock_mutex();
 	}
 
 	_exit_dm_lib();

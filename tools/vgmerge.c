@@ -22,7 +22,7 @@ static struct volume_group *_vgmerge_vg_read(struct cmd_context *cmd,
 	log_verbose("Checking for volume group \"%s\"", vg_name);
 	vg = vg_read_for_update(cmd, vg_name, NULL, 0);
 	if (vg_read_error(vg)) {
-		free_vg(vg);
+		release_vg(vg);
 		return NULL;
 	}
 	return vg;
@@ -54,7 +54,7 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 		vg_to = _vgmerge_vg_read(cmd, vg_name_to);
 		if (!vg_to) {
 			stack;
-			unlock_and_free_vg(cmd, vg_from, vg_name_from);
+			unlock_and_release_vg(cmd, vg_from, vg_name_from);
 			return ECMD_FAILED;
 		}
 	} else {
@@ -67,7 +67,7 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 		vg_from = _vgmerge_vg_read(cmd, vg_name_from);
 		if (!vg_from) {
 			stack;
-			unlock_and_free_vg(cmd, vg_to, vg_name_to);
+			unlock_and_release_vg(cmd, vg_to, vg_name_to);
 			return ECMD_FAILED;
 		}
 	}
@@ -80,7 +80,8 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 	if (!archive(vg_from) || !archive(vg_to))
 		goto_bad;
 
-	drop_cached_metadata(vg_from);
+	if (!drop_cached_metadata(vg_from))
+		stack;
 
 	/* Merge volume groups */
 	dm_list_iterate_items_safe(pvl, tpvl, &vg_from->pvs) {
@@ -147,23 +148,23 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 	/* FIXME Remove /dev/vgfrom */
 
 	backup(vg_to);
-	log_print("Volume group \"%s\" successfully merged into \"%s\"",
-		  vg_from->name, vg_to->name);
+	log_print_unless_silent("Volume group \"%s\" successfully merged into \"%s\"",
+				vg_from->name, vg_to->name);
 	r = ECMD_PROCESSED;
 bad:
-	if (lock_vg_from_first) {
-		unlock_and_free_vg(cmd, vg_to, vg_name_to);
-		unlock_and_free_vg(cmd, vg_from, vg_name_from);
-	} else {
-		unlock_and_free_vg(cmd, vg_from, vg_name_from);
-		unlock_and_free_vg(cmd, vg_to, vg_name_to);
-	}
+	/*
+	 * Note: as vg_to is referencing moved elements from vg_from
+	 * the order of release_vg calls is mandatory.
+	 */
+	unlock_and_release_vg(cmd, vg_to, vg_name_to);
+	unlock_and_release_vg(cmd, vg_from, vg_name_from);
+
 	return r;
 }
 
 int vgmerge(struct cmd_context *cmd, int argc, char **argv)
 {
-	char *vg_name_to, *vg_name_from;
+	const char *vg_name_to, *vg_name_from;
 	int opt = 0;
 	int ret = 0, ret_max = 0;
 

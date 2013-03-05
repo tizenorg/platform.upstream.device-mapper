@@ -68,11 +68,15 @@ struct device_area {
 int dev_get_size(const struct device *dev, uint64_t *size);
 int dev_get_sectsize(struct device *dev, uint32_t *size);
 int dev_get_read_ahead(struct device *dev, uint32_t *read_ahead);
+int dev_discard_blocks(struct device *dev, uint64_t offset_bytes, uint64_t size_bytes);
 
 /* Use quiet version if device number could change e.g. when opening LV */
 int dev_open(struct device *dev);
 int dev_open_quiet(struct device *dev);
 int dev_open_flags(struct device *dev, int flags, int direct, int quiet);
+int dev_open_readonly(struct device *dev);
+int dev_open_readonly_buffered(struct device *dev);
+int dev_open_readonly_quiet(struct device *dev);
 int dev_close(struct device *dev);
 int dev_close_immediate(struct device *dev);
 void dev_close_all(void);
@@ -83,9 +87,9 @@ const char *dev_name(const struct device *dev);
 
 int dev_read(struct device *dev, uint64_t offset, size_t len, void *buffer);
 int dev_read_circular(struct device *dev, uint64_t offset, size_t len,
-		      uint64_t offset2, size_t len2, void *buf);
+		      uint64_t offset2, size_t len2, char *buf);
 int dev_write(struct device *dev, uint64_t offset, size_t len, void *buffer);
-int dev_append(struct device *dev, size_t len, void *buffer);
+int dev_append(struct device *dev, size_t len, char *buffer);
 int dev_set(struct device *dev, uint64_t offset, size_t len, int value);
 void dev_flush(struct device *dev);
 
@@ -114,5 +118,11 @@ unsigned long dev_minimum_io_size(const char *sysfs_dir,
 
 unsigned long dev_optimal_io_size(const char *sysfs_dir,
 				  struct device *dev);
+
+unsigned long dev_discard_max_bytes(const char *sysfs_dir,
+				    struct device *dev);
+
+unsigned long dev_discard_granularity(const char *sysfs_dir,
+				      struct device *dev);
 
 #endif

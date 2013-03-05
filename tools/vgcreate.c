@@ -49,6 +49,8 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	if (vgcreate_params_validate(cmd, &vp_new))
 	    return EINVALID_CMD_LINE;
 
+	lvmcache_seed_infos_from_lvmetad(cmd);
+
 	/* Create the new VG */
 	vg = vg_create(cmd, vp_new.vg_name);
 	if (vg_read_error(vg)) {
@@ -56,7 +58,7 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 			log_error("A volume group called %s already exists.", vp_new.vg_name);
 		else
 			log_error("Can't get lock for %s.", vp_new.vg_name);
-		free_vg(vg);
+		release_vg(vg);
 		return ECMD_FAILED;
 	}
 
@@ -74,7 +76,7 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	/* attach the pv's */
-	if (!vg_extend(vg, argc, argv, &pp))
+	if (!vg_extend(vg, argc, (const char* const*)argv, &pp))
 		goto_bad;
 
 	if (vp_new.max_lv != vg->max_lv)
@@ -117,16 +119,16 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 
 	backup(vg);
 
-	log_print("%s%colume group \"%s\" successfully created",
-		  clustered_message, *clustered_message ? 'v' : 'V', vg->name);
+	log_print_unless_silent("%s%colume group \"%s\" successfully created",
+				clustered_message, *clustered_message ? 'v' : 'V', vg->name);
 
-	free_vg(vg);
+	release_vg(vg);
 	return ECMD_PROCESSED;
 
 bad:
 	unlock_vg(cmd, VG_ORPHANS);
 bad_orphan:
-	free_vg(vg);
+	release_vg(vg);
 	unlock_vg(cmd, vp_new.vg_name);
 	return ECMD_FAILED;
 }

@@ -23,7 +23,7 @@ struct replicator_device;
 
 struct logical_volume {
 	union lvid lvid;
-	char *name;
+	const char *name;
 
 	struct volume_group *vg;
 
@@ -46,9 +46,13 @@ struct logical_volume {
 	struct dm_list segments;
 	struct dm_list tags;
 	struct dm_list segs_using_this_lv;
+
+	uint64_t timestamp;
+	const char *hostname;
 };
 
 uint64_t lv_size(const struct logical_volume *lv);
+uint64_t lv_metadata_size(const struct logical_volume *lv);
 char *lv_attr_dup(struct dm_pool *mem, const struct logical_volume *lv);
 char *lv_uuid_dup(const struct logical_volume *lv);
 char *lv_tags_dup(const struct logical_volume *lv);
@@ -59,6 +63,9 @@ char *lv_convert_lv_dup(struct dm_pool *mem, const struct logical_volume *lv);
 int lv_kernel_major(const struct logical_volume *lv);
 int lv_kernel_minor(const struct logical_volume *lv);
 char *lv_mirror_log_dup(struct dm_pool *mem, const struct logical_volume *lv);
+char *lv_data_lv_dup(struct dm_pool *mem, const struct logical_volume *lv);
+char *lv_metadata_lv_dup(struct dm_pool *mem, const struct logical_volume *lv);
+char *lv_pool_lv_dup(struct dm_pool *mem, const struct logical_volume *lv);
 char *lv_modules_dup(struct dm_pool *mem, const struct logical_volume *lv);
 char *lv_name_dup(struct dm_pool *mem, const struct logical_volume *lv);
 char *lv_origin_dup(struct dm_pool *mem, const struct logical_volume *lv);
@@ -66,7 +73,12 @@ uint32_t lv_kernel_read_ahead(const struct logical_volume *lv);
 uint64_t lvseg_start(const struct lv_segment *seg);
 uint64_t lvseg_size(const struct lv_segment *seg);
 uint64_t lvseg_chunksize(const struct lv_segment *seg);
-char *lvseg_segtype_dup(const struct lv_segment *seg);
+char *lvseg_segtype_dup(struct dm_pool *mem, const struct lv_segment *seg);
 char *lvseg_tags_dup(const struct lv_segment *seg);
-
+char *lvseg_devices(struct dm_pool *mem, const struct lv_segment *seg);
+char *lvseg_seg_pe_ranges(struct dm_pool *mem, const struct lv_segment *seg);
+char *lv_time_dup(struct dm_pool *mem, const struct logical_volume *lv);
+char *lv_host_dup(struct dm_pool *mem, const struct logical_volume *lv);
+int lv_set_creation(struct logical_volume *lv,
+		    const char *hostname, uint64_t timestamp);
 #endif /* _LVM_LV_H */

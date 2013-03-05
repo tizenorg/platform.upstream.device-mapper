@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2002-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2009 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2011 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -20,6 +20,7 @@
 #include "clvmd-common.h"
 
 #include <pthread.h>
+#include <getopt.h>
 
 #include "clvmd-comms.h"
 #include "clvm.h"
@@ -48,6 +49,7 @@
 #endif
 
 #define MAX_RETRIES 4
+#define MAX_MISSING_LEN 8000 /* Max supported clvmd message size ? */
 
 #define ISLOCAL_CSID(c) (memcmp(c, our_csid, max_csid_len) == 0)
 
@@ -77,15 +79,18 @@ struct lvm_thread_cmd {
 };
 
 struct lvm_startup_params {
-	int using_gulm;
-	char **argv;
+	struct dm_hash_table *excl_uuid;
 };
 
-debug_t debug;
+static debug_t debug = DEBUG_OFF;
+static int foreground_mode = 0;
 static pthread_t lvm_thread;
+/* Stack size 128KiB for thread, must be bigger then DEFAULT_RESERVED_STACK */
+static const size_t STACK_SIZE = 128 * 1024;
+static pthread_attr_t stack_attr;
 static pthread_mutex_t lvm_thread_mutex;
 static pthread_cond_t lvm_thread_cond;
-static pthread_mutex_t lvm_start_mutex;
+static pthread_barrier_t lvm_start_barrier;
 static struct dm_list lvm_cmd_head;
 static volatile sig_atomic_t quit = 0;
 static volatile sig_atomic_t reread_config = 0;
@@ -99,9 +104,7 @@ static int child_pipe[2];
 #define DFAIL_TIMEOUT    5
 #define SUCCESS          0
 
-typedef enum {IF_AUTO, IF_CMAN, IF_GULM, IF_OPENAIS, IF_COROSYNC, IF_SINGLENODE} if_type_t;
-
-typedef void *(lvm_pthread_fn_t)(void*);
+typedef enum {IF_AUTO, IF_CMAN, IF_OPENAIS, IF_COROSYNC, IF_SINGLENODE} if_type_t;
 
 /* Prototypes for code further down */
 static void sigusr2_handler(int sig);
@@ -132,7 +135,7 @@ static int check_all_clvmds_running(struct local_client *client);
 static int local_rendezvous_callback(struct local_client *thisfd, char *buf,
 				     int len, const char *csid,
 				     struct local_client **new_client);
-static void lvm_thread_fn(void *) __attribute__ ((noreturn));
+static void *lvm_thread_fn(void *) __attribute__((noreturn));
 static int add_to_lvmqueue(struct local_client *client, struct clvm_header *msg,
 			   int msglen, const char *csid);
 static int distribute_command(struct local_client *thisfd);
@@ -145,12 +148,12 @@ static if_type_t get_cluster_type(void);
 
 static void usage(const char *prog, FILE *file)
 {
-	fprintf(file, "Usage:\n"
-		"%s [Vhd]\n\n"
+	fprintf(file, "Usage: %s [options]\n"
 		"   -V       Show version of clvmd\n"
 		"   -h       Show this help information\n"
-		"   -d       Set debug level\n"
-		"            If starting clvmd then don't fork, run in the foreground\n"
+		"   -d[n]    Set debug logging (0:none, 1:stderr (implies -f option), 2:syslog)\n"
+		"   -f       Don't fork, run in the foreground\n"
+		"   -E<lockuuid> Take this lock uuid as exclusively locked resource (for restart)\n"
 		"   -R       Tell all running clvmds in the cluster to reload their device cache\n"
 		"   -S       Restart clvmd, preserving exclusive locks\n"
 		"   -C       Sets debug level (from -d) on all clvmd instances clusterwide\n"
@@ -166,9 +169,6 @@ static void usage(const char *prog, FILE *file)
 #endif
 #ifdef USE_OPENAIS
 		"openais "
-#endif
-#ifdef USE_GULM
-		"gulm "
 #endif
 #ifdef USE_SINGLENODE
 		"singlenode "
@@ -199,7 +199,8 @@ static void safe_close(int *fd)
 	if (*fd >= 0) {
 		int to_close = *fd;
 		*fd = -1;
-		close(to_close);
+		if (close(to_close))
+			log_sys_error("close", ""); /* path */
 	}
 }
 
@@ -209,14 +210,15 @@ void debuglog(const char *fmt, ...)
 	va_list ap;
 	static int syslog_init = 0;
 
-	if (debug == DEBUG_STDERR) {
+	switch (clvmd_get_debug()) {
+	case DEBUG_STDERR:
 		va_start(ap,fmt);
 		time(&P);
 		fprintf(stderr, "CLVMD[%x]: %.15s ", (int)pthread_self(), ctime(&P)+4 );
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
-	}
-	if (debug == DEBUG_SYSLOG) {
+		break;
+	case DEBUG_SYSLOG:
 		if (!syslog_init) {
 			openlog("clvmd", LOG_PID, LOG_DAEMON);
 			syslog_init = 1;
@@ -225,7 +227,26 @@ void debuglog(const char *fmt, ...)
 		va_start(ap,fmt);
 		vsyslog(LOG_DEBUG, fmt, ap);
 		va_end(ap);
+		break;
+	case DEBUG_OFF:
+		break;
 	}
+}
+
+void clvmd_set_debug(debug_t new_debug)
+{
+	if (!foreground_mode && new_debug == DEBUG_STDERR)
+		new_debug = DEBUG_SYSLOG;
+
+	if (new_debug > DEBUG_SYSLOG)
+		new_debug = DEBUG_SYSLOG;
+
+	debug = new_debug;
+}
+
+debug_t clvmd_get_debug(void)
+{
+	return debug;
 }
 
 static const char *decode_cmd(unsigned char cmdl)
@@ -276,12 +297,15 @@ static const char *decode_cmd(unsigned char cmdl)
 	case CLVMD_CMD_RESTART:
 		command = "RESTART";
 		break;
+	case CLVMD_CMD_SYNC_NAMES:
+		command = "SYNC_NAMES";
+		break;
 	default:
 		command = "unknown";
 		break;
 	}
 
-	sprintf(buf, "%s (0x%x)", command, cmdl);
+	snprintf(buf, sizeof(buf), "%s (0x%x)", command, cmdl);
 
 	return buf;
 }
@@ -312,52 +336,63 @@ static void check_permissions(void)
 int main(int argc, char *argv[])
 {
 	int local_sock;
-	struct local_client *newfd;
-	struct utsname nodeinfo;
+	struct local_client *newfd, *delfd;
 	struct lvm_startup_params lvm_params;
-	signed char opt;
+	int opt;
 	int cmd_timeout = DEFAULT_CMD_TIMEOUT;
 	int start_timeout = 0;
 	if_type_t cluster_iface = IF_AUTO;
 	sigset_t ss;
-	int using_gulm = 0;
-	int debug_opt = 0;
+	debug_t debug_opt = DEBUG_OFF;
+	debug_t debug_arg = DEBUG_OFF;
 	int clusterwide_opt = 0;
 	mode_t old_mask;
+	int ret = 1;
+
+	struct option longopts[] = {
+		{ "help", 0, 0, 'h' },
+		{ NULL, 0, 0, 0 }
+	};
+
+	if (!(lvm_params.excl_uuid = dm_hash_create(128))) {
+		fprintf(stderr, "Failed to allocate hash table\n");
+		return 1;
+	}
 
 	/* Deal with command-line arguments */
 	opterr = 0;
 	optind = 0;
-	while ((opt = getopt(argc, argv, "?vVhd::t:RST:CI:E:")) != EOF) {
+	while ((opt = getopt_long(argc, argv, "vVhfd::t:RST:CI:E:",
+				  longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'h':
 			usage(argv[0], stdout);
 			exit(0);
 
-		case '?':
-			usage(argv[0], stderr);
-			exit(0);
-
 		case 'R':
 			check_permissions();
-			return refresh_clvmd(1)==1?0:1;
+			ret = (refresh_clvmd(1) == 1) ? 0 : 1;
+			goto out;
 
 		case 'S':
 			check_permissions();
-			return restart_clvmd(clusterwide_opt)==1?0:1;
+			ret = (restart_clvmd(clusterwide_opt) == 1) ? 0 : 1;
+			goto out;
 
 		case 'C':
 			clusterwide_opt = 1;
 			break;
 
 		case 'd':
-			debug_opt = 1;
-			if (optarg)
-				debug = atoi(optarg);
-			else
-				debug = DEBUG_STDERR;
+			debug_opt = DEBUG_STDERR;
+			debug_arg = optarg ? (debug_t) atoi(optarg) : DEBUG_STDERR;
+			if (debug_arg == DEBUG_STDERR)
+				foreground_mode = 1;
 			break;
 
+		case 'f':
+			foreground_mode = 1;
+			break;
 		case 't':
 			cmd_timeout = atoi(optarg);
 			if (!cmd_timeout) {
@@ -368,6 +403,12 @@ int main(int argc, char *argv[])
 			break;
 		case 'I':
 			cluster_iface = parse_cluster_interface(optarg);
+			break;
+		case 'E':
+			if (!dm_hash_insert(lvm_params.excl_uuid, optarg, optarg)) {
+				fprintf(stderr, "Failed to allocate hash entry\n");
+				goto out;
+			}
 			break;
 		case 'T':
 			start_timeout = atoi(optarg);
@@ -386,19 +427,13 @@ int main(int argc, char *argv[])
 			exit(0);
 			break;
 
+		default:
+			usage(argv[0], stderr);
+			exit(2);
 		}
 	}
 
 	check_permissions();
-
-	/* Setting debug options on an existing clvmd */
-	if (debug_opt && !check_local_clvmd()) {
-
-		/* Sending to stderr makes no sense for a detached daemon */
-		if (debug == DEBUG_STDERR)
-			debug = DEBUG_SYSLOG;
-		return debug_clvmd(debug, clusterwide_opt)==1?0:1;
-	}
 
 	/*
 	 * Switch to C locale to avoid reading large locale-archive file
@@ -408,12 +443,19 @@ int main(int argc, char *argv[])
 	if (setenv("LANG", "C", 1))
 		perror("Cannot set LANG to C");
 
-	/* Fork into the background (unless requested not to) */
-	if (debug != DEBUG_STDERR) {
-		be_daemon(start_timeout);
+	/* Setting debug options on an existing clvmd */
+	if (debug_opt && !check_local_clvmd()) {
+		dm_hash_destroy(lvm_params.excl_uuid);
+		return debug_clvmd(debug_arg, clusterwide_opt)==1?0:1;
 	}
 
-        dm_prepare_selinux_context(DEFAULT_RUN_DIR, S_IFDIR);
+	clvmd_set_debug(debug_opt);
+
+	/* Fork into the background (unless requested not to) */
+	if (!foreground_mode)
+		be_daemon(start_timeout);
+
+        (void) dm_prepare_selinux_context(DEFAULT_RUN_DIR, S_IFDIR);
         old_mask = umask(0077);
         if (dm_create_dir(DEFAULT_RUN_DIR) == 0) {
                 DEBUGLOG("clvmd: unable to create %s directory\n",
@@ -447,7 +489,7 @@ int main(int argc, char *argv[])
 
 	/* Set up signal handlers, USR1 is for cluster change notifications (in cman)
 	   USR2 causes child threads to exit.
-	   HUP causes gulm version to re-read nodes list from CCS.
+	   (HUP used to cause gulm to re-read the nodes list from CCS.)
 	   PIPE should be ignored */
 	signal(SIGUSR2, sigusr2_handler);
 	signal(SIGHUP,  sighup_handler);
@@ -462,9 +504,14 @@ int main(int argc, char *argv[])
 
 	/* Initialise the LVM thread variables */
 	dm_list_init(&lvm_cmd_head);
+	if (pthread_attr_init(&stack_attr) ||
+	    pthread_attr_setstacksize(&stack_attr, STACK_SIZE)) {
+		log_sys_error("pthread_attr_init", "");
+		exit(1);
+	}
 	pthread_mutex_init(&lvm_thread_mutex, NULL);
 	pthread_cond_init(&lvm_thread_cond, NULL);
-	pthread_mutex_init(&lvm_start_mutex, NULL);
+	pthread_barrier_init(&lvm_start_barrier, NULL, 2);
 	init_lvhash();
 
 	/* Start the cluster interface */
@@ -478,16 +525,6 @@ int main(int argc, char *argv[])
 		max_cluster_member_name_len = CMAN_MAX_NODENAME_LEN;
 		syslog(LOG_NOTICE, "Cluster LVM daemon started - connected to CMAN");
 	}
-#endif
-#ifdef USE_GULM
-	if (!clops)
-		if ((cluster_iface == IF_AUTO || cluster_iface == IF_GULM) && (clops = init_gulm_cluster())) {
-			max_csid_len = GULM_MAX_CSID_LEN;
-			max_cluster_message = GULM_MAX_CLUSTER_MESSAGE;
-			max_cluster_member_name_len = GULM_MAX_CLUSTER_MEMBER_NAME_LEN;
-			using_gulm = 1;
-			syslog(LOG_NOTICE, "Cluster LVM daemon started - connected to GULM");
-		}
 #endif
 #ifdef USE_COROSYNC
 	if (!clops)
@@ -526,7 +563,6 @@ int main(int argc, char *argv[])
 	DEBUGLOG("Cluster ready, doing some more initialisation\n");
 
 	/* Save our CSID */
-	uname(&nodeinfo);
 	clops->get_our_csid(our_csid);
 
 	/* Initialise the FD list head */
@@ -553,16 +589,12 @@ int main(int argc, char *argv[])
 	DEBUGLOG("starting LVM thread\n");
 
 	/* Don't let anyone else to do work until we are started */
-	pthread_mutex_lock(&lvm_start_mutex);
-	lvm_params.using_gulm = using_gulm;
-	lvm_params.argv = argv;
-	pthread_create(&lvm_thread, NULL, (lvm_pthread_fn_t*)lvm_thread_fn,
-			(void *)&lvm_params);
+	pthread_create(&lvm_thread, &stack_attr, lvm_thread_fn, &lvm_params);
+
+	/* Don't start until the LVM thread is ready */
+	pthread_barrier_wait(&lvm_start_barrier);
 
 	/* Tell the rest of the cluster our version number */
-	/* CMAN can do this immediately, gulm needs to wait until
-	   the core initialisation has finished and the node list
-	   has been gathered */
 	if (clops->cluster_init_completed)
 		clops->cluster_init_completed();
 
@@ -576,15 +608,39 @@ int main(int argc, char *argv[])
 	/* Do some work */
 	main_loop(local_sock, cmd_timeout);
 
+	pthread_mutex_lock(&lvm_thread_mutex);
+	pthread_cond_signal(&lvm_thread_cond);
+	pthread_mutex_unlock(&lvm_thread_mutex);
+	if ((errno = pthread_join(lvm_thread, NULL)))
+		log_sys_error("pthread_join", "");
+
 	close_local_sock(local_sock);
 	destroy_lvm();
 
-	return 0;
+	for (newfd = local_client_head.next; newfd != NULL;) {
+		delfd = newfd;
+		newfd = newfd->next;
+		if (delfd->fd == local_sock)
+			delfd->fd = -1;
+		/*
+		 * FIXME:
+		 * needs cleanup code from read_from_local_sock() for now
+		 * break of 'clvmd' may access already free memory here.
+		 */
+		safe_close(&(delfd->fd));
+		free(delfd);
+	}
+
+	ret = 0;
+out:
+	dm_hash_destroy(lvm_params.excl_uuid);
+
+	return ret;
 }
 
-/* Called when the GuLM cluster layer has completed initialisation.
+/* Called when the cluster layer has completed initialisation.
    We send the version message */
-void clvmd_cluster_init_completed()
+void clvmd_cluster_init_completed(void)
 {
 	send_version_message();
 }
@@ -616,7 +672,8 @@ static int local_rendezvous_callback(struct local_client *thisfd, char *buf,
 	if (client_fd >= 0) {
 		newfd = malloc(sizeof(struct local_client));
 		if (!newfd) {
-			close(client_fd);
+			if (close(client_fd))
+                                log_sys_error("close", "socket");
 			return 1;
 		}
 
@@ -666,9 +723,9 @@ static int local_pipe_callback(struct local_client *thisfd, char *buf,
 
 	/* EOF on pipe or an error, close it */
 	if (len <= 0) {
-		int jstat;
 		void *ret = &status;
-		close(thisfd->fd);
+		if (close(thisfd->fd))
+			log_sys_error("close", "local_pipe");
 
 		/* Clear out the cross-link */
 		if (thisfd->bits.pipe.client != NULL)
@@ -677,7 +734,10 @@ static int local_pipe_callback(struct local_client *thisfd, char *buf,
 
 		/* Reap child thread */
 		if (thisfd->bits.pipe.threadid) {
-			jstat = pthread_join(thisfd->bits.pipe.threadid, &ret);
+			if ((errno = pthread_join(thisfd->bits.pipe.threadid,
+						  &ret)))
+				log_sys_error("pthread_join", "");
+
 			thisfd->bits.pipe.threadid = 0;
 			if (thisfd->bits.pipe.client != NULL)
 				thisfd->bits.pipe.client->bits.localsock.
@@ -689,27 +749,25 @@ static int local_pipe_callback(struct local_client *thisfd, char *buf,
 			 status, sock_client);
 		/* But has the client gone away ?? */
 		if (sock_client == NULL) {
-			DEBUGLOG
-			    ("Got PIPE response for dead client, ignoring it\n");
+			DEBUGLOG("Got PIPE response for dead client, ignoring it\n");
 		} else {
 			/* If error then just return that code */
 			if (status)
 				send_local_reply(sock_client, status,
 						 sock_client->fd);
 			else {
-				if (sock_client->bits.localsock.state ==
-				    POST_COMMAND) {
+				/* FIXME: closer inspect this code since state is write thread protected */
+				pthread_mutex_lock(&sock_client->bits.localsock.mutex);
+				if (sock_client->bits.localsock.state == POST_COMMAND) {
+					pthread_mutex_unlock(&sock_client->bits.localsock.mutex);
 					send_local_reply(sock_client, 0,
 							 sock_client->fd);
-				} else	// PRE_COMMAND finished.
-				{
-					if (
-					    (status =
-					     distribute_command(sock_client)) !=
-					    0) send_local_reply(sock_client,
-								EFBIG,
-								sock_client->
-								fd);
+				} else {
+					/* PRE_COMMAND finished. */
+					pthread_mutex_unlock(&sock_client->bits.localsock.mutex);
+					if ((status = distribute_command(sock_client)))
+						send_local_reply(sock_client, EFBIG,
+								 sock_client->fd);
 				}
 			}
 		}
@@ -774,9 +832,10 @@ static void request_timed_out(struct local_client *client)
 /* This is where the real work happens */
 static void main_loop(int local_sock, int cmd_timeout)
 {
+	sigset_t ss;
+
 	DEBUGLOG("Using timeout of %d seconds\n", cmd_timeout);
 
-	sigset_t ss;
 	sigemptyset(&ss);
 	sigaddset(&ss, SIGINT);
 	sigaddset(&ss, SIGTERM);
@@ -827,7 +886,6 @@ static void main_loop(int local_sock, int cmd_timeout)
 					struct local_client *free_fd;
 					lastfd->next = thisfd->next;
 					free_fd = thisfd;
-					thisfd = lastfd;
 
 					DEBUGLOG("removeme set for fd %d\n", free_fd->fd);
 
@@ -863,7 +921,6 @@ static void main_loop(int local_sock, int cmd_timeout)
 							 ret, errno);
 						lastfd->next = thisfd->next;
 						free_fd = thisfd;
-						thisfd = lastfd;
 						safe_close(&(free_fd->fd));
 
 						/* Queue cleanup, this also frees the client struct */
@@ -987,7 +1044,10 @@ static void be_daemon(int timeout)
 		exit(3);
 	}
 
-	pipe(child_pipe);
+	if (pipe(child_pipe)) {
+		perror("Error creating pipe");
+		exit(3);
+	}
 
 	switch (fork()) {
 	case -1:
@@ -995,11 +1055,11 @@ static void be_daemon(int timeout)
 		exit(2);
 
 	case 0:		/* Child */
-	        close(child_pipe[0]);
+		(void) close(child_pipe[0]);
 		break;
 
 	default:       /* Parent */
-		close(child_pipe[1]);
+		(void) close(child_pipe[1]);
 		wait_for_child(child_pipe[0], timeout);
 	}
 
@@ -1030,9 +1090,9 @@ static int read_from_local_sock(struct local_client *thisfd)
 	int len;
 	int argslen;
 	int missing_len;
-	char buffer[PIPE_BUF];
+	char buffer[PIPE_BUF + 1];
 
-	len = read(thisfd->fd, buffer, sizeof(buffer));
+	len = read(thisfd->fd, buffer, sizeof(buffer) - 1);
 	if (len == -1 && errno == EINTR)
 		return 1;
 
@@ -1041,7 +1101,6 @@ static int read_from_local_sock(struct local_client *thisfd)
 	/* EOF or error on socket */
 	if (len <= 0) {
 		int *status;
-		int jstat;
 
 		DEBUGLOG("EOF on local socket: inprogress=%d\n",
 			 thisfd->bits.localsock.in_progress);
@@ -1068,9 +1127,10 @@ static int read_from_local_sock(struct local_client *thisfd)
 			pthread_cond_signal(&thisfd->bits.localsock.cond);
 			pthread_mutex_unlock(&thisfd->bits.localsock.mutex);
 
-			jstat =
-			    pthread_join(thisfd->bits.localsock.threadid,
-					 (void **) &status);
+			if ((errno = pthread_join(thisfd->bits.localsock.threadid,
+						  (void **) &status)))
+				log_sys_error("pthread_join", "");
+
 			DEBUGLOG("Joined child thread\n");
 
 			thisfd->bits.localsock.threadid = 0;
@@ -1083,8 +1143,8 @@ static int read_from_local_sock(struct local_client *thisfd)
 				struct local_client *lastfd = NULL;
 				struct local_client *free_fd = NULL;
 
-				close(thisfd->bits.localsock.pipe_client->fd);	/* Close pipe */
-				close(thisfd->bits.localsock.pipe);
+				(void) close(thisfd->bits.localsock.pipe_client->fd);	/* Close pipe */
+				(void) close(thisfd->bits.localsock.pipe);
 
 				/* Remove pipe client */
 				for (newfd = &local_client_head; newfd != NULL;
@@ -1122,6 +1182,7 @@ static int read_from_local_sock(struct local_client *thisfd)
 		struct clvm_header *inheader;
 		int status;
 
+		buffer[len] = 0; /* Ensure \0 terminated */
 		inheader = (struct clvm_header *) buffer;
 
 		/* Fill in the client ID */
@@ -1129,19 +1190,15 @@ static int read_from_local_sock(struct local_client *thisfd)
 
 		/* If we are already busy then return an error */
 		if (thisfd->bits.localsock.in_progress) {
-			struct clvm_header reply;
-			reply.cmd = CLVMD_CMD_REPLY;
-			reply.status = EBUSY;
-			reply.arglen = 0;
-			reply.flags = 0;
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = EBUSY
+			};
 			send_message(&reply, sizeof(reply), our_csid,
 				     thisfd->fd,
 				     "Error sending EBUSY reply to local user");
 			return len;
 		}
-
-		/* Free any old buffer space */
-		free(thisfd->bits.localsock.cmd);
 
 		/* See if we have the whole message */
 		argslen =
@@ -1151,15 +1208,30 @@ static int read_from_local_sock(struct local_client *thisfd)
 		if (missing_len < 0)
 			missing_len = 0;
 
+		/* We need at least sizeof(struct clvm_header) bytes in buffer */
+		if (len < sizeof(struct clvm_header) || argslen < 0 ||
+		    missing_len > MAX_MISSING_LEN) {
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = EINVAL
+			};
+			send_message(&reply, sizeof(reply), our_csid,
+				     thisfd->fd,
+				     "Error sending EINVAL reply to local user");
+			return 0;
+		}
+
+		/* Free any old buffer space */
+		free(thisfd->bits.localsock.cmd);
+
 		/* Save the message */
 		thisfd->bits.localsock.cmd = malloc(len + missing_len);
 
 		if (!thisfd->bits.localsock.cmd) {
-			struct clvm_header reply;
-			reply.cmd = CLVMD_CMD_REPLY;
-			reply.status = ENOMEM;
-			reply.arglen = 0;
-			reply.flags = 0;
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = ENOMEM
+			};
 			send_message(&reply, sizeof(reply), our_csid,
 				     thisfd->fd,
 				     "Error sending ENOMEM reply to local user");
@@ -1174,15 +1246,22 @@ static int read_from_local_sock(struct local_client *thisfd)
 			char *argptr =
 			    inheader->node + strlen(inheader->node) + 1;
 
-			while (missing_len > 0 && len >= 0) {
-				DEBUGLOG
-				    ("got %d bytes, need another %d (total %d)\n",
-				     argslen, missing_len, inheader->arglen);
+			while (missing_len > 0) {
+				DEBUGLOG("got %d bytes, need another %d (total %d)\n",
+					 argslen, missing_len, inheader->arglen);
 				len = read(thisfd->fd, argptr + argslen,
 					   missing_len);
-				if (len >= 0) {
+				if (len == -1 && errno == EINTR)
+					continue;
+				if (len > 0) {
 					missing_len -= len;
 					argslen += len;
+				} else {
+					/* EOF or error on socket */
+					DEBUGLOG("EOF on local socket\n");
+					free(thisfd->bits.localsock.cmd);
+					thisfd->bits.localsock.cmd = NULL;
+					return 0;
 				}
 			}
 		}
@@ -1207,13 +1286,12 @@ static int read_from_local_sock(struct local_client *thisfd)
 		/* Check the node name for validity */
 		if (inheader->node[0] && clops->csid_from_name(csid, inheader->node)) {
 			/* Error, node is not in the cluster */
-			struct clvm_header reply;
-			DEBUGLOG("Unknown node: '%s'\n", inheader->node);
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = ENOENT
+			};
 
-			reply.cmd = CLVMD_CMD_REPLY;
-			reply.status = ENOENT;
-			reply.flags = 0;
-			reply.arglen = 0;
+			DEBUGLOG("Unknown node: '%s'\n", inheader->node);
 			send_message(&reply, sizeof(reply), our_csid,
 				     thisfd->fd,
 				     "Error sending ENOENT reply to local user");
@@ -1234,17 +1312,29 @@ static int read_from_local_sock(struct local_client *thisfd)
 		}
 
 		/* Create a pipe and add the reading end to our FD list */
-		pipe(comms_pipe);
+		if (pipe(comms_pipe)) {
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = EBUSY
+			};
+
+			DEBUGLOG("creating pipe failed: %s\n", strerror(errno));
+			send_message(&reply, sizeof(reply), our_csid,
+				     thisfd->fd,
+				     "Error sending EBUSY reply to local user");
+			return len;
+		}
+
 		newfd = malloc(sizeof(struct local_client));
 		if (!newfd) {
-			struct clvm_header reply;
-			close(comms_pipe[0]);
-			close(comms_pipe[1]);
+			struct clvm_header reply = {
+				.cmd = CLVMD_CMD_REPLY,
+				.status = ENOMEM
+			};
 
-			reply.cmd = CLVMD_CMD_REPLY;
-			reply.status = ENOMEM;
-			reply.arglen = 0;
-			reply.flags = 0;
+			(void) close(comms_pipe[0]);
+			(void) close(comms_pipe[1]);
+
 			send_message(&reply, sizeof(reply), our_csid,
 				     thisfd->fd,
 				     "Error sending ENOMEM reply to local user");
@@ -1279,8 +1369,8 @@ static int read_from_local_sock(struct local_client *thisfd)
 		thisfd->bits.localsock.in_progress = TRUE;
 		thisfd->bits.localsock.state = PRE_COMMAND;
 		DEBUGLOG("Creating pre&post thread\n");
-		status = pthread_create(&thisfd->bits.localsock.threadid, NULL,
-			       pre_and_post_thread, thisfd);
+		status = pthread_create(&thisfd->bits.localsock.threadid,
+					&stack_attr, pre_and_post_thread, thisfd);
 		DEBUGLOG("Created pre&post thread, state = %d\n", status);
 	}
 	return len;
@@ -1306,7 +1396,10 @@ static int distribute_command(struct local_client *thisfd)
 	int len = thisfd->bits.localsock.cmd_len;
 
 	thisfd->xid = global_xid++;
-	DEBUGLOG("distribute command: XID = %d\n", thisfd->xid);
+	DEBUGLOG("distribute command: XID = %d, flags=0x%x (%s%s)\n",
+		 thisfd->xid, inheader->flags,
+		(inheader->flags & CLVMD_FLAG_LOCAL) ? "LOCAL" : "",
+		(inheader->flags & CLVMD_FLAG_REMOTE) ? "REMOTE" : "");
 
 	/* Forward it to other nodes in the cluster if needed */
 	if (!(inheader->flags & CLVMD_FLAG_LOCAL)) {
@@ -1319,7 +1412,11 @@ static int distribute_command(struct local_client *thisfd)
 			thisfd->bits.localsock.in_progress = TRUE;
 			thisfd->bits.localsock.sent_out = TRUE;
 
-			/* Do it here first */
+			/*
+			 * Send to local node first, even if CLVMD_FLAG_REMOTE
+			 * is set so we still get a reply if this is the
+			 * only node.
+			 */
 			add_to_lvmqueue(thisfd, inheader, len, NULL);
 
 			DEBUGLOG("Sending message to all cluster nodes\n");
@@ -1372,7 +1469,6 @@ static void process_remote_command(struct clvm_header *msg, int msglen, int fd,
 	int replylen = 0;
 	int buflen = max_cluster_message - sizeof(struct clvm_header) - 1;
 	int status;
-	int msg_malloced = 0;
 
 	/* Get the node name as we /may/ need it later */
 	clops->name_from_csid(csid, nodename);
@@ -1431,9 +1527,9 @@ static void process_remote_command(struct clvm_header *msg, int msglen, int fd,
 
 	if (replyargs != NULL) {
 		/* Run the command */
-		status =
-		    do_command(NULL, msg, msglen, &replyargs, buflen,
-			       &replylen);
+		/* FIXME: usage of init_test() is unprotected */
+		status = do_command(NULL, msg, msglen, &replyargs,
+				    buflen, &replylen);
 	} else {
 		status = ENOMEM;
 	}
@@ -1481,10 +1577,6 @@ static void process_remote_command(struct clvm_header *msg, int msglen, int fd,
 		}
 	}
 
-	/* Free buffer if it was malloced */
-	if (msg_malloced) {
-		free(msg);
-	}
 	free(replyargs);
 }
 
@@ -1554,11 +1646,6 @@ static __attribute__ ((noreturn)) void *pre_and_post_thread(void *arg)
 	DEBUGLOG("in sub thread: client = %p\n", client);
 	pthread_mutex_lock(&client->bits.localsock.mutex);
 
-	/* Don't start until the LVM thread is ready */
-	pthread_mutex_lock(&lvm_start_mutex);
-	pthread_mutex_unlock(&lvm_start_mutex);
-	DEBUGLOG("Sub thread ready for work.\n");
-
 	/* Ignore SIGUSR1 (handled by master process) but enable
 	   SIGUSR2 (kills subthreads) */
 	sigemptyset(&ss);
@@ -1572,6 +1659,7 @@ static __attribute__ ((noreturn)) void *pre_and_post_thread(void *arg)
 	/* Loop around doing PRE and POST functions until the client goes away */
 	while (!client->bits.localsock.finished) {
 		/* Execute the code */
+		/* FIXME: usage of init_test() is unprotected as in do_command() */
 		status = do_pre_command(client);
 
 		if (status)
@@ -1654,7 +1742,12 @@ static int process_local_command(struct clvm_header *msg, int msglen,
 	if (replybuf == NULL)
 		return -1;
 
-	status = do_command(client, msg, msglen, &replybuf, buflen, &replylen);
+	/* If remote flag is set, just set a successful status code. */
+	if (msg->flags & CLVMD_FLAG_REMOTE)
+		status = 0;
+	else
+		/* FIXME: usage of init_test() is unprotected */
+		status = do_command(client, msg, msglen, &replybuf, buflen, &replylen);
 
 	if (status)
 		client->bits.localsock.all_success = 0;
@@ -1723,13 +1816,18 @@ static void send_local_reply(struct local_client *client, int status, int fd)
 	}
 
 	/* Add in the size of our header */
-	message_len = message_len + sizeof(struct clvm_header) + 1;
-	replybuf = malloc(message_len);
+	message_len = message_len + sizeof(struct clvm_header);
+	if (!(replybuf = malloc(message_len))) {
+		DEBUGLOG("Memory allocation fails\n");
+		return;
+	}
 
 	clientreply = (struct clvm_header *) replybuf;
 	clientreply->status = status;
 	clientreply->cmd = CLVMD_CMD_REPLY;
 	clientreply->node[0] = '\0';
+	clientreply->xid = 0;
+	clientreply->clientid = 0;
 	clientreply->flags = 0;
 
 	ptr = clientreply->args;
@@ -1764,7 +1862,7 @@ static void send_local_reply(struct local_client *client, int status, int fd)
 	/* Terminate with an empty node name */
 	*ptr = '\0';
 
-	clientreply->arglen = ptr - clientreply->args + 1;
+	clientreply->arglen = ptr - clientreply->args;
 
 	/* And send it */
 	send_message(replybuf, message_len, our_csid, fd,
@@ -1795,7 +1893,7 @@ static void free_reply(struct local_client *client)
 }
 
 /* Send our version number to the cluster */
-static void send_version_message()
+static void send_version_message(void)
 {
 	char message[sizeof(struct clvm_header) + sizeof(int) * 3];
 	struct clvm_header *msg = (struct clvm_header *) message;
@@ -1847,7 +1945,7 @@ static int send_message(void *buf, int msglen, const char *csid, int fd,
 				break;
 			}
 
-			len = write(fd, buf + ptr, msglen - ptr);
+			len = write(fd, (char*)buf + ptr, msglen - ptr);
 
 			if (len <= 0) {
 				if (errno == EINTR)
@@ -1900,11 +1998,11 @@ static int process_work_item(struct lvm_thread_cmd *cmd)
 /*
  * Routine that runs in the "LVM thread".
  */
-static void lvm_thread_fn(void *arg)
+static void *lvm_thread_fn(void *arg)
 {
-	struct dm_list *cmdl, *tmp;
 	sigset_t ss;
 	struct lvm_startup_params *lvm_params = arg;
+	struct lvm_thread_cmd *cmd;
 
 	DEBUGLOG("LVM thread function started\n");
 
@@ -1915,24 +2013,22 @@ static void lvm_thread_fn(void *arg)
 	pthread_sigmask(SIG_BLOCK, &ss, NULL);
 
 	/* Initialise the interface to liblvm */
-	init_clvm(lvm_params->using_gulm, lvm_params->argv);
+	init_clvm(lvm_params->excl_uuid);
 
 	/* Allow others to get moving */
-	pthread_mutex_unlock(&lvm_start_mutex);
+	pthread_barrier_wait(&lvm_start_barrier);
+	DEBUGLOG("Sub thread ready for work.\n");
 
 	/* Now wait for some actual work */
-	for (;;) {
-		DEBUGLOG("LVM thread waiting for work\n");
+	pthread_mutex_lock(&lvm_thread_mutex);
 
-		pthread_mutex_lock(&lvm_thread_mutex);
-		if (dm_list_empty(&lvm_cmd_head))
+	while (!quit) {
+		if (dm_list_empty(&lvm_cmd_head)) {
+			DEBUGLOG("LVM thread waiting for work\n");
 			pthread_cond_wait(&lvm_thread_cond, &lvm_thread_mutex);
-
-		dm_list_iterate_safe(cmdl, tmp, &lvm_cmd_head) {
-			struct lvm_thread_cmd *cmd;
-
-			cmd =
-			    dm_list_struct_base(cmdl, struct lvm_thread_cmd, list);
+		} else {
+			cmd = dm_list_item(dm_list_first(&lvm_cmd_head),
+					   struct lvm_thread_cmd);
 			dm_list_del(&cmd->list);
 			pthread_mutex_unlock(&lvm_thread_mutex);
 
@@ -1942,8 +2038,11 @@ static void lvm_thread_fn(void *arg)
 
 			pthread_mutex_lock(&lvm_thread_mutex);
 		}
-		pthread_mutex_unlock(&lvm_thread_mutex);
 	}
+
+	pthread_mutex_unlock(&lvm_thread_mutex);
+
+	pthread_exit(NULL);
 }
 
 /* Pass down some work to the LVM thread */
@@ -1994,42 +2093,52 @@ static int add_to_lvmqueue(struct local_client *client, struct clvm_header *msg,
 static int check_local_clvmd(void)
 {
 	int local_socket;
-	struct sockaddr_un sockaddr;
 	int ret = 0;
+	struct sockaddr_un sockaddr = { .sun_family = AF_UNIX };
 
-	/* Open local socket */
-	if ((local_socket = socket(PF_UNIX, SOCK_STREAM, 0)) < 0) {
+	if (!dm_strncpy(sockaddr.sun_path, CLVMD_SOCKNAME, sizeof(sockaddr.sun_path))) {
+		log_error("%s: clvmd socket name too long.", CLVMD_SOCKNAME);
 		return -1;
 	}
 
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	memcpy(sockaddr.sun_path, CLVMD_SOCKNAME, sizeof(CLVMD_SOCKNAME));
-	sockaddr.sun_family = AF_UNIX;
+	/* Open local socket */
+	if ((local_socket = socket(PF_UNIX, SOCK_STREAM, 0)) < 0) {
+		log_sys_error("socket", "local socket");
+		return -1;
+	}
 
 	if (connect(local_socket,(struct sockaddr *) &sockaddr,
 		    sizeof(sockaddr))) {
+		log_sys_error("connect", "local socket");
 		ret = -1;
 	}
 
-	close(local_socket);
+	if (close(local_socket))
+		log_sys_error("close", "local socket");
+
 	return ret;
 }
 
 static void close_local_sock(int local_socket)
 {
 	if (local_socket != -1 && close(local_socket))
-		stack;
+		log_sys_error("close", CLVMD_SOCKNAME);
 
 	if (CLVMD_SOCKNAME[0] != '\0' && unlink(CLVMD_SOCKNAME))
 		stack;
 }
 
 /* Open the local socket, that's the one we talk to libclvm down */
-static int open_local_sock()
+static int open_local_sock(void)
 {
-	int local_socket = -1;
-	struct sockaddr_un sockaddr;
 	mode_t old_mask;
+	int local_socket = -1;
+	struct sockaddr_un sockaddr = { .sun_family = AF_UNIX };
+
+	if (!dm_strncpy(sockaddr.sun_path, CLVMD_SOCKNAME, sizeof(sockaddr.sun_path))) {
+		log_error("%s: clvmd socket name too long.", CLVMD_SOCKNAME);
+		return -1;
+	}
 
 	close_local_sock(local_socket);
 
@@ -2046,11 +2155,9 @@ static int open_local_sock()
 	/* Set Close-on-exec & non-blocking */
 	if (fcntl(local_socket, F_SETFD, 1))
 		DEBUGLOG("setting CLOEXEC on local_socket failed: %s\n", strerror(errno));
-	fcntl(local_socket, F_SETFL, fcntl(local_socket, F_GETFL, 0) | O_NONBLOCK);
+	if (fcntl(local_socket, F_SETFL, fcntl(local_socket, F_GETFL, 0) | O_NONBLOCK))
+		DEBUGLOG("setting O_NONBLOCK on local_socket failed: %s\n", strerror(errno));
 
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	memcpy(sockaddr.sun_path, CLVMD_SOCKNAME, sizeof(CLVMD_SOCKNAME));
-	sockaddr.sun_family = AF_UNIX;
 
 	if (bind(local_socket, (struct sockaddr *) &sockaddr, sizeof(sockaddr))) {
 		log_error("can't bind local socket: %m");
@@ -2071,7 +2178,7 @@ error:
 	return -1;
 }
 
-void process_message(struct local_client *client, const char *buf, int len,
+void process_message(struct local_client *client, char *buf, int len,
 		     const char *csid)
 {
 	struct clvm_header *inheader;
@@ -2108,7 +2215,7 @@ static struct local_client *find_client(int clientid)
 {
 	struct local_client *thisfd;
 	for (thisfd = &local_client_head; thisfd != NULL; thisfd = thisfd->next) {
-		if (thisfd->fd == ntohl(clientid))
+		if (thisfd->fd == (int)ntohl(clientid))
 			return thisfd;
 	}
 	return NULL;
@@ -2170,8 +2277,6 @@ static if_type_t parse_cluster_interface(char *ifname)
 		iface = IF_AUTO;
 	if (!strcmp(ifname, "cman"))
 		iface = IF_CMAN;
-	if (!strcmp(ifname, "gulm"))
-		iface = IF_GULM;
 	if (!strcmp(ifname, "openais"))
 		iface = IF_OPENAIS;
 	if (!strcmp(ifname, "corosync"))
@@ -2187,7 +2292,7 @@ static if_type_t parse_cluster_interface(char *ifname)
  * only called if the command-line option is not present, and if it fails
  * we still try the interfaces in order.
  */
-static if_type_t get_cluster_type()
+static if_type_t get_cluster_type(void)
 {
 #ifdef HAVE_COROSYNC_CONFDB_H
 	confdb_handle_t handle;
@@ -2226,6 +2331,9 @@ static if_type_t get_cluster_type()
         result = confdb_key_get(handle, clvmd_handle, (void *)"interface", strlen("interface"), buf, &namelen);
         if (result != CS_OK)
 		goto out;
+
+	if (namelen >= sizeof(buf))
+		namelen = sizeof(buf) - 1;
 
 	buf[namelen] = '\0';
 	type = parse_cluster_interface(buf);

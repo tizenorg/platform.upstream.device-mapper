@@ -30,12 +30,17 @@ DD=dd
 CUT=cut
 DATE=date
 BASENAME=basename
+UDEVADM=udevadm
 UNAME=uname
+TR=tr
+SOCAT=socat # either socat or nc is needed for dumping lvmetad state
+NC=nc
 
 # user may override lvm and dmsetup location by setting LVM_BINARY
 # and DMSETUP_BINARY respectively
 LVM=${LVM_BINARY-lvm}
 DMSETUP=${DMSETUP_BINARY-dmsetup}
+LVMETAD_SOCKET=${LVM_LVMETAD_SOCKET-/var/run/lvm/lvmetad.socket}
 
 die() {
     code=$1; shift
@@ -54,15 +59,18 @@ function usage {
 	echo "    -m gather LVM metadata from the PVs"
 	echo "    -d <directory> dump into a directory instead of tarball"
 	echo "    -c if running clvmd, gather cluster data as well"
+	echo "    -u gather udev info and context"
+	echo "    -l gather lvmetad state if running"
 	echo ""
-	
+
 	exit 1
 }
 
 advanced=0
 clustered=0
 metadata=0
-while getopts :acd:hm opt; do
+udev=0
+while getopts :acd:hmul opt; do
 	case $opt in 
 		s)      sysreport=1 ;;
 		a)	advanced=1 ;;
@@ -70,13 +78,15 @@ while getopts :acd:hm opt; do
 		d)	userdir=$OPTARG ;;
 		h)	usage ;;
 		m)	metadata=1 ;;
+		u)	udev=1 ;;
+		l)	lvmetad=1 ;;
 		:)	echo "$0: $OPTARG requires a value:"; usage ;;
 		\?)     echo "$0: unknown option $OPTARG"; usage ;;
 		*)	usage ;;
 	esac
 done
 
-NOW=`$DATE -u +%G%m%d%k%M%S | /usr/bin/tr -d ' '`
+NOW=`$DATE -u +%G%m%d%k%M%S | $TR -d ' '`
 if test -n "$userdir"; then
 	dir="$userdir"
 else
@@ -116,7 +126,7 @@ if (( $advanced )); then
 	myecho "Gathering LVM volume info..."
 
 	myecho "  vgscan..."
-	log "\"$LVM\" vgscan -vvvv > \"$dir/vgscan\" 2>&1"
+	log "\"$LVM\" vgscan -vvvv >> \"$dir/vgscan\" 2>&1"
 
 	myecho "  pvscan..."
 	log "\"$LVM\" pvscan -v >> \"$dir/pvscan\" 2>> \"$log\""
@@ -125,10 +135,10 @@ if (( $advanced )); then
 	log "\"$LVM\" lvs -a -o +devices >> \"$dir/lvs\" 2>> \"$log\""
 
 	myecho "  pvs..."
-	log "\"$LVM\" pvs -a -v > \"$dir/pvs\" 2>> \"$log\""
+	log "\"$LVM\" pvs -a -v >> \"$dir/pvs\" 2>> \"$log\""
 
 	myecho "  vgs..."
-	log "\"$LVM\" vgs -v > \"$dir/vgs\" 2>> \"$log\""
+	log "\"$LVM\" vgs -v >> \"$dir/vgs\" 2>> \"$log\""
 fi
 
 if (( $clustered )); then
@@ -166,11 +176,11 @@ if (( $clustered )); then
 		echo "MASTER:"
 		cat /debug/dlm/clvmd_master
 	fi
-	} > $dir/cluster_info
+	} >> $dir/cluster_info
 fi
 
 myecho "Gathering LVM & device-mapper version info..."
-echo "LVM VERSION:" > "$dir/versions"
+echo "LVM VERSION:" >> "$dir/versions"
 "$LVM" lvs --version >> "$dir/versions" 2>> "$log"
 echo "DEVICE MAPPER VERSION:" >> "$dir/versions"
 "$DMSETUP" --version >> "$dir/versions" 2>> "$log"
@@ -180,24 +190,27 @@ echo "DM TARGETS VERSIONS:" >> "$dir/versions"
 "$DMSETUP" targets >> "$dir/versions" 2>> "$log"
 
 myecho "Gathering dmsetup info..."
-log "\"$DMSETUP\" info -c > \"$dir/dmsetup_info\" 2>> \"$log\""
-log "\"$DMSETUP\" table > \"$dir/dmsetup_table\" 2>> \"$log\""
-log "\"$DMSETUP\" status > \"$dir/dmsetup_status\" 2>> \"$log\""
+log "\"$DMSETUP\" info -c >> \"$dir/dmsetup_info\" 2>> \"$log\""
+log "\"$DMSETUP\" table >> \"$dir/dmsetup_table\" 2>> \"$log\""
+log "\"$DMSETUP\" status >> \"$dir/dmsetup_status\" 2>> \"$log\""
+
+# cat as workaround to avoid tty ioctl (selinux)
+log "\"$DMSETUP\" ls --tree 2>> \"$log\" | cat >> \"$dir/dmsetup_ls_tree\""
 
 myecho "Gathering process info..."
-log "$PS alx > \"$dir/ps_info\" 2>> \"$log\""
+log "$PS alx >> \"$dir/ps_info\" 2>> \"$log\""
 
 myecho "Gathering console messages..."
-log "$TAIL -n 75 /var/log/messages > \"$dir/messages\" 2>> \"$log\""
+log "$TAIL -n 75 /var/log/messages >> \"$dir/messages\" 2>> \"$log\""
 
 myecho "Gathering /etc/lvm info..."
 log "$CP -a /etc/lvm \"$dir/lvm\" 2>> \"$log\""
 
 myecho "Gathering /dev listing..."
-log "$LS -laR /dev > \"$dir/dev_listing\" 2>> \"$log\""
+log "$LS -laR /dev >> \"$dir/dev_listing\" 2>> \"$log\""
 
 myecho "Gathering /sys/block listing..."
-log "$LS -laR /sys/block > \"$dir/sysblock_listing\"  2>> \"$log\""
+log "$LS -laR /sys/block >> \"$dir/sysblock_listing\"  2>> \"$log\""
 log "$LS -laR /sys/devices/virtual/block >> \"$dir/sysblock_listing\"  2>> \"$log\""
 
 if (( $metadata )); then
@@ -218,6 +231,36 @@ if (( $metadata )); then
 	done
 fi
 
+if (( $udev )); then
+	myecho "Gathering udev info..."
+
+	udev_dir="$dir/udev"
+
+	log "$MKDIR -p \"$udev_dir\""
+	log "$UDEVADM info --version >> \"$udev_dir/version\" 2>> \"$log\""
+	log "$UDEVADM info --export-db >> \"$udev_dir/db\" 2>> \"$log\""
+	log "$CP -a /etc/udev/udev.conf \"$udev_dir/conf\" 2>> \"$log\""
+	log "$LS -la /lib/udev >> \"$udev_dir/lib_dir\" 2>> \"$log\""
+	log "$CP -aR /etc/udev/rules.d \"$udev_dir/rules_etc\" 2>> \"$log\""
+	log "$CP -aR /lib/udev/rules.d \"$udev_dir/rules_lib\" 2>> \"$log\""
+fi
+
+if (( $lvmetad )); then
+    (echo 'request="dump"'; echo '##') | {
+	if type -p $SOCAT >& /dev/null; then
+	    echo "$SOCAT unix-connect:$LVMETAD_SOCKET -" >> "$log"
+	    $SOCAT "unix-connect:$LVMETAD_SOCKET" - 2>> "$log"
+	elif echo | $NC -U "$LVMETAD_SOCKET"; then
+	    echo "$NC -U $LVMETAD_SOCKET" >> "$log"
+	    $NC -U "$LVMETAD_SOCKET" 2>> "$log"
+	else
+	    myecho "WARNING: Neither socat nor nc -U seems to be available." 1>&2
+	    echo "# DUMP FAILED"
+	    return 1
+	fi
+    } > "$dir/lvmetad.txt"
+fi
+
 if test -z "$userdir"; then
 	lvm_dump="$dirbase.tgz"
 	myecho "Creating report tarball in $HOME/$lvm_dump..."
@@ -232,4 +275,3 @@ if test -z "$userdir"; then
 fi
 
 exit 0
-
