@@ -10,7 +10,7 @@ Release:        1
 License:        GPL-2.0
 Summary:        Device mapper utility
 Url:            http://sources.redhat.com/dm
-Group:          System/Base
+Group:          Base/Device Management
 Source0:        ftp://sources.redhat.com/pub/lvm2/LVM2.%{lvm2_version}.tgz
 Requires:       libdevmapper = %{device_mapper_version}-%{release}
 
@@ -32,7 +32,7 @@ the device-mapper libraries.
 %package -n libdevmapper
 License:        LGPL-2.1
 Summary:        Device-mapper shared library
-Group:          System/Libraries
+Group:          Base/Device Management
 Obsoletes:      device-mapper < 1.02.17-6
 
 %description -n libdevmapper
