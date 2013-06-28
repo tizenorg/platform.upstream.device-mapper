@@ -12,6 +12,7 @@ Summary:        Device mapper utility
 Url:            http://sources.redhat.com/dm
 Group:          Base/Device Management
 Source0:        ftp://sources.redhat.com/pub/lvm2/LVM2.%{lvm2_version}.tgz
+Source1001: 	device-mapper.manifest
 Requires:       libdevmapper = %{device_mapper_version}-%{release}
 
 %description
@@ -40,6 +41,7 @@ This package contains the device-mapper shared library, libdevmapper.
 
 %prep
 %setup -q -n LVM2.%{lvm2_version}
+cp %{SOURCE1001} .
 
 %build
 %define _exec_prefix ""
@@ -57,18 +59,21 @@ sed -i 's/ (.*)//g' %{buildroot}%{_libdir}/pkgconfig/*.pc
 %postun -n libdevmapper -p /sbin/ldconfig
 
 %files
+%manifest %{name}.manifest
 %defattr(-,root,root,-)
 %license COPYING COPYING.LIB
 %attr(755,root,root) %{_sbindir}/dmsetup
 %{_mandir}/man8/dmsetup.8.gz
 
 %files devel
+%manifest %{name}.manifest
 %defattr(-,root,root,-)
 %attr(755,root,root) /%{_libdir}/libdevmapper.so
 %{_includedir}/libdevmapper.h
 %{_libdir}/pkgconfig/*.pc
 
 %files -n libdevmapper
+%manifest %{name}.manifest
 %attr(755,root,root) /%{_libdir}/libdevmapper.so.*
 
 
